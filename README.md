@@ -1,18 +1,15 @@
 # aegis-relay
 
-`aegis-relay` is the untrusted store-and-forward service for AMP envelopes and encrypted blobs.
+Reference relay server for Aegis.
 
-It should be boring in the best possible way:
+## Endpoints
 
-- validate the outer envelope shape
-- store opaque ciphertext safely
-- return recipient-scoped message sets
-- never require plaintext access
+- `GET /healthz`
+- `POST /v1/envelopes`
+- `GET /v1/envelopes/:recipient_id`
 
-## Early goals
+## Behavior
 
-- file-backed storage for local development
-- simple HTTP API
-- recipient-indexed fetch
-- size limits and basic retention hooks
-- a clean boundary for future auth, quotas, and anti-replay bookkeeping
+- `POST /v1/envelopes` accepts `StoreEnvelopeRequest` JSON from `aegis-api-types` and persists the embedded `Envelope`.
+- `GET /v1/envelopes/:recipient_id` returns `FetchEnvelopeResponse` JSON from `aegis-api-types`.
+- `aegit relay fetch --out <dir>` can materialize that response into individual envelope files for local opening with `aegit msg open`.
