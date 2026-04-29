@@ -2,6 +2,10 @@
 
 Reference relay server for Aegis.
 
+For local end-to-end developer workflow (including running this relay with `aegit`), see:
+
+- `../aegit-cli/DEV-SETUP.md`
+
 ## Endpoints
 
 - `GET /healthz`
