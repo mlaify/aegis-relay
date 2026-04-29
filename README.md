@@ -25,9 +25,9 @@ Reference relay server for Aegis.
 - `GET /v1/envelopes/:recipient_id` returns `FetchEnvelopeResponse` JSON from `aegis-api-types`.
 - `aegit relay fetch --out <dir>` can materialize that response into individual envelope files for local opening with `aegit msg open`.
 
-## Current v0.1 Status
+## Current v0.1.0-alpha Status
 
-This relay is a reference store-and-forward implementation.
+This relay is a `v0.1.0-alpha` reference store-and-forward implementation.
 
 - no authentication/authorization yet
 - no replay database yet
