@@ -178,7 +178,7 @@ impl FileStore {
 }
 
 fn safe_name(input: &str) -> String {
-    input.replace(':', "_").replace('/', "_")
+    input.replace([':', '/'], "_")
 }
 
 fn is_expired(envelope: &Envelope) -> bool {

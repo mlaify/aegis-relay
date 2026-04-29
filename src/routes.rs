@@ -95,8 +95,8 @@ pub async fn acknowledge_envelope(
     headers: HeaderMap,
     Path((recipient_id, envelope_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = require_lifecycle_token(&state, &headers) {
-        return resp;
+    if let Err(err) = require_lifecycle_token(&state, &headers) {
+        return err.into_response();
     }
     match state.store.acknowledge(&recipient_id, &envelope_id).await {
         Ok(LifecycleOutcome::Acknowledged) => Json(EnvelopeLifecycleResponse {
@@ -126,8 +126,8 @@ pub async fn delete_envelope(
     headers: HeaderMap,
     Path((recipient_id, envelope_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = require_lifecycle_token(&state, &headers) {
-        return resp;
+    if let Err(err) = require_lifecycle_token(&state, &headers) {
+        return err.into_response();
     }
     match state.store.delete(&recipient_id, &envelope_id).await {
         Ok(LifecycleOutcome::Deleted) => Json(EnvelopeLifecycleResponse {
@@ -153,8 +153,8 @@ pub async fn delete_envelope(
 }
 
 pub async fn cleanup_store(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_lifecycle_token(&state, &headers) {
-        return resp;
+    if let Err(err) = require_lifecycle_token(&state, &headers) {
+        return err.into_response();
     }
     match state.store.cleanup().await {
         Ok(report) => Json(RelayCleanupResponse {
@@ -170,7 +170,10 @@ pub async fn cleanup_store(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
 }
 
-fn require_lifecycle_token(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+fn require_lifecycle_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), LifecycleAuthError> {
     let Some(required) = state.capability_token.as_deref() else {
         return Ok(());
     };
@@ -178,16 +181,30 @@ fn require_lifecycle_token(state: &AppState, headers: &HeaderMap) -> Result<(), 
     let provided = token_from_headers(headers);
     match provided {
         Some(token) if token == required => Ok(()),
-        Some(_) => Err(error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "invalid relay capability token",
-        )),
-        None => Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing relay capability token",
-        )),
+        Some(_) => Err(LifecycleAuthError::Forbidden),
+        None => Err(LifecycleAuthError::Unauthorized),
+    }
+}
+
+enum LifecycleAuthError {
+    Unauthorized,
+    Forbidden,
+}
+
+impl LifecycleAuthError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing relay capability token",
+            ),
+            Self::Forbidden => error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "invalid relay capability token",
+            ),
+        }
     }
 }
 
