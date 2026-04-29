@@ -29,6 +29,7 @@ dependencies = [
  "aegis-api-types",
  "aegis-proto",
  "axum",
+ "chrono",
  "serde",
  "serde_json",
  "tokio",

@@ -18,11 +18,15 @@ Reference relay server for Aegis.
 - `GET /healthz`
 - `POST /v1/envelopes`
 - `GET /v1/envelopes/:recipient_id`
+- `POST /v1/envelopes/:recipient_id/:envelope_id/ack`
+- `DELETE /v1/envelopes/:recipient_id/:envelope_id`
 
 ## Behavior
 
 - `POST /v1/envelopes` accepts `StoreEnvelopeRequest` JSON from `aegis-api-types` and persists the embedded `Envelope`.
+- `POST /v1/envelopes` rejects structurally invalid envelopes with structured relay errors.
 - `GET /v1/envelopes/:recipient_id` returns `FetchEnvelopeResponse` JSON from `aegis-api-types`.
+- `GET /v1/envelopes/:recipient_id` skips expired envelopes (`expires_at`) and opportunistically removes expired files in file-backed storage.
 - `aegit relay fetch --out <dir>` can materialize that response into individual envelope files for local opening with `aegit msg open`.
 
 ## Current v0.1.0-alpha Status

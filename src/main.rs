@@ -3,7 +3,10 @@ mod storage;
 
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{delete, get, post},
+    Router,
+};
 use storage::FileStore;
 
 #[tokio::main]
@@ -13,6 +16,14 @@ async fn main() {
         .route("/healthz", get(routes::healthz))
         .route("/v1/envelopes", post(routes::store_envelope))
         .route("/v1/envelopes/:recipient_id", get(routes::fetch_envelopes))
+        .route(
+            "/v1/envelopes/:recipient_id/:envelope_id/ack",
+            post(routes::acknowledge_envelope),
+        )
+        .route(
+            "/v1/envelopes/:recipient_id/:envelope_id",
+            delete(routes::delete_envelope),
+        )
         .with_state(store);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
