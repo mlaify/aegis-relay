@@ -1,0 +1,25 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout aegis-core sibling for path dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: mlaify/aegis-core
+          path: aegis-core
+      - name: Expose ../aegis-core path
+        run: ln -s "$GITHUB_WORKSPACE/aegis-core" "$GITHUB_WORKSPACE/../aegis-core"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test
