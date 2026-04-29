@@ -20,6 +20,7 @@ Reference relay server for Aegis.
 - `GET /v1/envelopes/:recipient_id`
 - `POST /v1/envelopes/:recipient_id/:envelope_id/ack`
 - `DELETE /v1/envelopes/:recipient_id/:envelope_id`
+- `POST /v1/cleanup`
 
 ## Behavior
 
@@ -27,7 +28,17 @@ Reference relay server for Aegis.
 - `POST /v1/envelopes` rejects structurally invalid envelopes with structured relay errors.
 - `GET /v1/envelopes/:recipient_id` returns `FetchEnvelopeResponse` JSON from `aegis-api-types`.
 - `GET /v1/envelopes/:recipient_id` skips expired envelopes (`expires_at`) and opportunistically removes expired files in file-backed storage.
+- lifecycle-changing endpoints (`ack`, `delete`, `cleanup`) support optional local-dev token gating via `AEGIS_RELAY_CAPABILITY_TOKEN`.
 - `aegit relay fetch --out <dir>` can materialize that response into individual envelope files for local opening with `aegit msg open`.
+
+## Local-Dev Token (Optional)
+
+When `AEGIS_RELAY_CAPABILITY_TOKEN` is set, lifecycle-changing operations require a token header.
+
+Supported headers:
+
+- `Authorization: Bearer <token>`
+- `X-Aegis-Relay-Token: <token>`
 
 ## Current v0.1.0-alpha Status
 

@@ -14,6 +14,12 @@ pub enum LifecycleOutcome {
     NotFound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub expired_removed: usize,
+    pub orphan_ack_removed: usize,
+}
+
 impl FileStore {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
@@ -107,6 +113,55 @@ impl FileStore {
             let _ = tokio::fs::remove_file(ack_path).await;
         }
         Ok(LifecycleOutcome::Deleted)
+    }
+
+    pub async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+        let mut report = CleanupReport {
+            expired_removed: 0,
+            orphan_ack_removed: 0,
+        };
+        if !tokio::fs::try_exists(&self.base).await? {
+            return Ok(report);
+        }
+
+        let mut recipient_dirs = tokio::fs::read_dir(&self.base).await?;
+        while let Some(recipient_entry) = recipient_dirs.next_entry().await? {
+            let recipient_path = recipient_entry.path();
+            if !recipient_path.is_dir() {
+                continue;
+            }
+            let mut files = tokio::fs::read_dir(&recipient_path).await?;
+            while let Some(file_entry) = files.next_entry().await? {
+                let path = file_entry.path();
+                match path.extension().and_then(|v| v.to_str()) {
+                    Some("json") => {
+                        let raw = tokio::fs::read_to_string(&path).await?;
+                        let envelope: Envelope = serde_json::from_str(&raw)?;
+                        if is_expired(&envelope) {
+                            let _ = tokio::fs::remove_file(&path).await;
+                            report.expired_removed += 1;
+                        }
+                    }
+                    Some("ack") => {
+                        let stem = path
+                            .file_stem()
+                            .and_then(|v| v.to_str())
+                            .unwrap_or_default();
+                        if stem.is_empty() {
+                            continue;
+                        }
+                        let envelope_path = recipient_path.join(format!("{stem}.json"));
+                        if !tokio::fs::try_exists(envelope_path).await? {
+                            let _ = tokio::fs::remove_file(&path).await;
+                            report.orphan_ack_removed += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     fn envelope_path(&self, recipient_id: &str, envelope_id: &str) -> PathBuf {
@@ -226,6 +281,29 @@ mod tests {
             .await
             .expect("fetch");
         assert!(fetched.is_empty());
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_expired_and_orphan_ack_files() {
+        let base = std::env::temp_dir().join(format!("aegis-relay-clean-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let store = FileStore::new(&base);
+
+        let mut expired = sample_envelope("amp:did:key:z6MkRecipient");
+        expired.expires_at = Some(Utc::now() - Duration::seconds(10));
+        store.store(&expired).await.expect("store expired");
+
+        let recipient_dir = base.join("amp_did_key_z6MkRecipient");
+        let orphan_ack = recipient_dir.join("orphan-envelope.ack");
+        tokio::fs::write(&orphan_ack, b"ack")
+            .await
+            .expect("write orphan ack");
+
+        let report = store.cleanup().await.expect("cleanup");
+        assert_eq!(report.expired_removed, 1);
+        assert_eq!(report.orphan_ack_removed, 1);
+
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }
