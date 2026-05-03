@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::config::RetentionPolicy;
 use aegis_proto::{Envelope, IdentityDocument};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,6 +18,15 @@ pub enum LifecycleOutcome {
 pub struct CleanupReport {
     pub expired_removed: usize,
     pub orphan_ack_removed: usize,
+    pub old_removed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayMetrics {
+    pub envelopes_total: usize,
+    pub envelopes_acknowledged: usize,
+    pub envelopes_active: usize,
+    pub identities_total: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +53,10 @@ pub trait Store: Send + Sync {
         recipient_id: &str,
         envelope_id: &str,
     ) -> Result<LifecycleOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>>;
+    async fn cleanup(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>>;
     async fn store_identity(
         &self,
         doc: &IdentityDocument,
@@ -56,6 +69,7 @@ pub trait Store: Send + Sync {
         &self,
         alias: &str,
     ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,10 +192,14 @@ impl Store for FileStore {
         Ok(LifecycleOutcome::Deleted)
     }
 
-    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+    async fn cleanup(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
         let mut report = CleanupReport {
             expired_removed: 0,
             orphan_ack_removed: 0,
+            old_removed: 0,
         };
         if !tokio::fs::try_exists(&self.base).await? {
             return Ok(report);
@@ -203,6 +221,15 @@ impl Store for FileStore {
                         if is_expired(&envelope) {
                             let _ = tokio::fs::remove_file(&path).await;
                             report.expired_removed += 1;
+                            continue;
+                        }
+                        if let Some(max_age_days) = policy.max_message_age_days {
+                            if envelope.created_at
+                                <= (Utc::now() - chrono::Duration::days(max_age_days))
+                            {
+                                let _ = tokio::fs::remove_file(&path).await;
+                                report.old_removed += 1;
+                            }
                         }
                     }
                     Some("ack") => {
@@ -276,6 +303,48 @@ impl Store for FileStore {
 
         Ok(None)
     }
+
+    async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>> {
+        let mut envelopes_total = 0usize;
+        let mut envelopes_acknowledged = 0usize;
+        let mut identities_total = 0usize;
+
+        if tokio::fs::try_exists(&self.base).await? {
+            let mut recipient_dirs = tokio::fs::read_dir(&self.base).await?;
+            while let Some(recipient_entry) = recipient_dirs.next_entry().await? {
+                let recipient_path = recipient_entry.path();
+                if !recipient_path.is_dir() {
+                    continue;
+                }
+                if recipient_path.file_name().and_then(|v| v.to_str()) == Some("identities") {
+                    let mut identity_files = tokio::fs::read_dir(&recipient_path).await?;
+                    while let Some(identity_entry) = identity_files.next_entry().await? {
+                        let path = identity_entry.path();
+                        if path.extension().and_then(|v| v.to_str()) == Some("json") {
+                            identities_total += 1;
+                        }
+                    }
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(&recipient_path).await?;
+                while let Some(file_entry) = files.next_entry().await? {
+                    let path = file_entry.path();
+                    if path.extension().and_then(|v| v.to_str()) == Some("json") {
+                        envelopes_total += 1;
+                    } else if path.extension().and_then(|v| v.to_str()) == Some("ack") {
+                        envelopes_acknowledged += 1;
+                    }
+                }
+            }
+        }
+        let envelopes_active = envelopes_total.saturating_sub(envelopes_acknowledged);
+        Ok(RelayMetrics {
+            envelopes_total,
+            envelopes_acknowledged,
+            envelopes_active,
+            identities_total,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +367,13 @@ const MIGRATIONS: &str = "
         identity_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS identity_aliases (
+        alias TEXT NOT NULL,
+        identity_id TEXT NOT NULL,
+        PRIMARY KEY (alias)
+    );
+    CREATE INDEX IF NOT EXISTS idx_identity_aliases_identity_id
+        ON identity_aliases(identity_id);
 ";
 
 pub struct SqliteStore {
@@ -428,22 +504,41 @@ impl Store for SqliteStore {
         })
     }
 
-    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
-        let (expired_removed, orphan_ack_removed) = self
+    async fn cleanup(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+        let max_age_days = policy.max_message_age_days;
+        let purge_acked = policy.purge_acknowledged_on_cleanup;
+        let (expired_removed, orphan_ack_removed, old_removed) = self
             .conn
-            .call(|c| {
+            .call(move |c| {
                 let expired = c.execute(
                     "DELETE FROM envelopes \
                      WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')",
                     [],
                 )?;
-                let acked = c.execute("DELETE FROM envelopes WHERE acknowledged = 1", [])?;
-                Ok((expired, acked))
+                let acked = if purge_acked {
+                    c.execute("DELETE FROM envelopes WHERE acknowledged = 1", [])?
+                } else {
+                    0
+                };
+                let old = if let Some(days) = max_age_days {
+                    c.execute(
+                        "DELETE FROM envelopes
+                         WHERE datetime(json_extract(envelope_json, '$.created_at')) <= datetime('now', ?1)",
+                        rusqlite::params![format!("-{} days", days)],
+                    )?
+                } else {
+                    0
+                };
+                Ok((expired, acked, old))
             })
             .await?;
         Ok(CleanupReport {
             expired_removed,
             orphan_ack_removed,
+            old_removed,
         })
     }
 
@@ -454,14 +549,28 @@ impl Store for SqliteStore {
         let identity_id = doc.identity_id.0.clone();
         let json = serde_json::to_string(doc)?;
         let updated_at = Utc::now().to_rfc3339();
+        let aliases = doc.aliases.clone();
         self.conn
             .call(move |c| {
-                c.execute(
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
                     "INSERT OR REPLACE INTO identities \
                      (identity_id, identity_json, updated_at) VALUES (?1, ?2, ?3)",
                     rusqlite::params![identity_id, json, updated_at],
-                )
-                .map_err(|e| e.into())
+                )?;
+                // Rebuild alias index for this identity atomically.
+                tx.execute(
+                    "DELETE FROM identity_aliases WHERE identity_id = ?1",
+                    rusqlite::params![identity_id],
+                )?;
+                for alias in &aliases {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO identity_aliases (alias, identity_id) \
+                         VALUES (?1, ?2)",
+                        rusqlite::params![alias, identity_id],
+                    )?;
+                }
+                tx.commit().map_err(|e| e.into())
             })
             .await?;
         Ok(())
@@ -495,26 +604,54 @@ impl Store for SqliteStore {
         alias: &str,
     ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
         let alias = alias.to_string();
-        let rows: Vec<String> = self
+        let result: Option<String> = self
             .conn
             .call(move |c| {
-                let mut stmt = c.prepare("SELECT identity_json FROM identities")?;
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.into());
-                rows
+                c.query_row(
+                    "SELECT i.identity_json \
+                     FROM identities i \
+                     JOIN identity_aliases a ON a.identity_id = i.identity_id \
+                     WHERE a.alias = ?1 \
+                     LIMIT 1",
+                    rusqlite::params![alias],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.into())
             })
             .await?;
-
-        for json in rows {
-            let doc: IdentityDocument = serde_json::from_str(&json)?;
-            if doc.aliases.iter().any(|a| a == &alias) {
-                return Ok(Some(doc));
-            }
+        match result {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
         }
+    }
 
-        Ok(None)
+    async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>> {
+        let (envelopes_total, envelopes_acknowledged, envelopes_active, identities_total) = self
+            .conn
+            .call(|c| {
+                let total: i64 = c.query_row("SELECT COUNT(*) FROM envelopes", [], |r| r.get(0))?;
+                let acked: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM envelopes WHERE acknowledged = 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let active: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM envelopes WHERE acknowledged = 0",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let identities: i64 =
+                    c.query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0))?;
+                Ok((total, acked, active, identities))
+            })
+            .await?;
+        Ok(RelayMetrics {
+            envelopes_total: envelopes_total as usize,
+            envelopes_acknowledged: envelopes_acknowledged as usize,
+            envelopes_active: envelopes_active as usize,
+            identities_total: identities_total as usize,
+        })
     }
 }
 
@@ -543,6 +680,7 @@ fn is_expired(envelope: &Envelope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{FileStore, LifecycleOutcome, SqliteStore, Store};
+    use crate::config::RetentionPolicy;
     use aegis_proto::{
         EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
     };
@@ -655,7 +793,13 @@ mod tests {
             .await
             .expect("write orphan ack");
 
-        let report = store.cleanup().await.expect("cleanup");
+        let report = store
+            .cleanup(&RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            })
+            .await
+            .expect("cleanup");
         assert_eq!(report.expired_removed, 1);
         assert_eq!(report.orphan_ack_removed, 1);
 
@@ -757,7 +901,13 @@ mod tests {
         store.store(&expired).await.expect("store expired");
         store.store(&fresh).await.expect("store fresh");
 
-        let report = store.cleanup().await.expect("cleanup");
+        let report = store
+            .cleanup(&RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            })
+            .await
+            .expect("cleanup");
         assert_eq!(report.expired_removed, 1);
 
         let fetched = store.fetch("amp:did:key:z6MkSqlite4").await.expect("fetch");
@@ -811,6 +961,61 @@ mod tests {
             resolved.unwrap().identity_id.0,
             "amp:did:key:z6MkIdentityAlias"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_resolve_alias_returns_none_for_unknown() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let result = store
+            .resolve_alias("nobody@nowhere")
+            .await
+            .expect("resolve");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_alias_index_updated_on_re_publish() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let id = "amp:did:key:z6MkAliasUpdate";
+
+        // First publish: alias "old@mesh"
+        let mut doc = sample_identity_doc(id);
+        doc.aliases = vec!["old@mesh".to_string()];
+        store.store_identity(&doc).await.expect("store v1");
+
+        // Re-publish: alias changed to "new@mesh"
+        doc.aliases = vec!["new@mesh".to_string()];
+        store.store_identity(&doc).await.expect("store v2");
+
+        // Old alias must not resolve any more
+        let old = store.resolve_alias("old@mesh").await.expect("resolve old");
+        assert!(old.is_none(), "stale alias must not resolve after re-publish");
+
+        // New alias must resolve
+        let new = store.resolve_alias("new@mesh").await.expect("resolve new");
+        assert!(new.is_some());
+        assert_eq!(new.unwrap().identity_id.0, id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_multiple_aliases_all_resolve() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let id = "amp:did:key:z6MkMultiAlias";
+        let mut doc = sample_identity_doc(id);
+        doc.aliases = vec!["alice@mesh".to_string(), "alice@example.com".to_string()];
+        store.store_identity(&doc).await.expect("store");
+
+        for alias in &["alice@mesh", "alice@example.com"] {
+            let resolved = store.resolve_alias(alias).await.expect("resolve");
+            assert!(resolved.is_some(), "alias {alias} must resolve");
+            assert_eq!(resolved.unwrap().identity_id.0, id);
+        }
     }
 
     #[tokio::test]

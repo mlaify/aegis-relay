@@ -21,6 +21,7 @@ Reference relay server for Aegis.
 - `POST /v1/envelopes/:recipient_id/:envelope_id/ack`
 - `DELETE /v1/envelopes/:recipient_id/:envelope_id`
 - `POST /v1/cleanup`
+- `GET /v1/status`
 - `PUT /v1/identities/:identity_id`
 - `GET /v1/identities/:identity_id`
 - `GET /v1/aliases/:alias`
@@ -33,24 +34,38 @@ Reference relay server for Aegis.
 - `PUT /v1/identities/:identity_id` stores a self-signed identity document after signature validation.
 - `GET /v1/identities/:identity_id` fetches identity documents by cryptographic identity id.
 - `GET /v1/aliases/:alias` resolves alias hints to identity documents.
+- `GET /v1/status` returns aggregate relay counters and auth mode metadata for operators.
 - `GET /v1/envelopes/:recipient_id` skips expired envelopes (`expires_at`) and opportunistically removes expired files in file-backed storage.
 - lifecycle-changing endpoints (`ack`, `delete`, `cleanup`) support optional local-dev token gating via `AEGIS_RELAY_CAPABILITY_TOKEN`.
 - `aegit relay fetch --out <dir>` can materialize that response into individual envelope files for local opening with `aegit msg open`.
 
-## Local-Dev Token (Optional)
+## Authorization (Reference)
 
-When `AEGIS_RELAY_CAPABILITY_TOKEN` is set, lifecycle-changing operations require a token header.
+When token auth is configured, selected write/lifecycle operations require a token header.
 
 Supported headers:
 
 - `Authorization: Bearer <token>`
 - `X-Aegis-Relay-Token: <token>`
 
+Environment controls:
+
+- `AEGIS_RELAY_AUTH_TOKENS=token1,token2` (preferred)
+- `AEGIS_RELAY_CAPABILITY_TOKEN=token` (legacy fallback)
+- `AEGIS_RELAY_REQUIRE_TOKEN_FOR_PUSH=true|false` (default `false`)
+- `AEGIS_RELAY_REQUIRE_TOKEN_FOR_IDENTITY_PUT=true|false` (default `true`)
+
+## Retention and Audit Controls
+
+- `AEGIS_RELAY_PURGE_ACKED_ON_CLEANUP=true|false` (default `true`)
+- `AEGIS_RELAY_MAX_MESSAGE_AGE_DAYS=<positive integer>` (optional)
+- `AEGIS_RELAY_AUDIT_LOG_PATH=/path/to/audit.log` (optional JSONL sink)
+
 ## Current v0.1.0-alpha Status
 
 This relay is a `v0.1.0-alpha` reference store-and-forward implementation.
 
-- no authentication/authorization yet
+- token auth is reference-only and not a full production identity/authz system
 - no replay database yet
 - not a production-grade bridge
 
