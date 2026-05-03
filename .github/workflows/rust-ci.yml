@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Checkout aegis-core sibling for path dependencies
-        uses: actions/checkout@v4
-        with:
-          repository: mlaify/aegis-core
-          path: aegis-core
+        run: |
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          git clone --depth 1 --branch "$BRANCH" https://github.com/mlaify/aegis-core.git aegis-core 2>/dev/null || \
+          git clone --depth 1 --branch main https://github.com/mlaify/aegis-core.git aegis-core
       - name: Expose ../aegis-core path
         run: ln -s "$GITHUB_WORKSPACE/aegis-core" "$GITHUB_WORKSPACE/../aegis-core"
       - uses: dtolnay/rust-toolchain@stable

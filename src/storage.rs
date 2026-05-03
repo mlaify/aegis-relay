@@ -203,6 +203,8 @@ mod tests {
             EncryptedBlob {
                 nonce_b64: "bm9uY2U=".to_string(),
                 ciphertext_b64: "Y2lwaGVydGV4dA==".to_string(),
+                eph_x25519_public_key_b64: None,
+                mlkem_ciphertext_b64: None,
             },
         )
     }
