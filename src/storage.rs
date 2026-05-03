@@ -301,7 +301,11 @@ impl Store for SqliteStore {
         let json = serde_json::to_string(envelope)?;
         let envelope_id = envelope.envelope_id.0.to_string();
         let recipient_id = envelope.recipient_id.0.clone();
-        let expires_at = envelope.expires_at.map(|t| t.to_rfc3339());
+        // Store in SQLite datetime format ("YYYY-MM-DD HH:MM:SS" UTC) so that
+        // comparisons against datetime('now') work as plain string comparisons.
+        let expires_at = envelope
+            .expires_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
         self.conn
             .call(move |c| {
                 c.execute(
@@ -482,8 +486,10 @@ fn is_expired(envelope: &Envelope) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileStore, LifecycleOutcome, Store};
-    use aegis_proto::{EncryptedBlob, Envelope, IdentityId, SuiteId};
+    use super::{FileStore, LifecycleOutcome, SqliteStore, Store};
+    use aegis_proto::{
+        EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
+    };
     use chrono::{Duration, Utc};
 
     fn sample_envelope(recipient: &str) -> Envelope {
@@ -598,5 +604,152 @@ mod tests {
         assert_eq!(report.orphan_ack_removed, 1);
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // SqliteStore tests
+    // -----------------------------------------------------------------------
+
+    fn sample_identity_doc(id: &str) -> IdentityDocument {
+        IdentityDocument {
+            version: 1,
+            identity_id: IdentityId(id.to_string()),
+            aliases: vec![],
+            signing_keys: vec![PublicKeyRecord {
+                key_id: "sig-1".to_string(),
+                algorithm: "AMP-ED25519-V1".to_string(),
+                public_key_b64: "c2lnbmluZ2tleQ==".to_string(),
+            }],
+            encryption_keys: vec![],
+            supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".to_string()],
+            relay_endpoints: vec![],
+            signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_round_trip_envelope() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkSqlite");
+        store.store(&envelope).await.expect("store");
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite").await.expect("fetch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].envelope_id.0, envelope.envelope_id.0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_acknowledge_hides_from_fetch() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkSqlite2");
+        let id = envelope.envelope_id.0.to_string();
+        store.store(&envelope).await.expect("store");
+
+        let outcome = store
+            .acknowledge("amp:did:key:z6MkSqlite2", &id)
+            .await
+            .expect("ack");
+        assert_eq!(outcome, LifecycleOutcome::Acknowledged);
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite2").await.expect("fetch");
+        assert!(fetched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_delete_removes_envelope() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkSqlite3");
+        let id = envelope.envelope_id.0.to_string();
+        store.store(&envelope).await.expect("store");
+
+        let outcome = store
+            .delete("amp:did:key:z6MkSqlite3", &id)
+            .await
+            .expect("delete");
+        assert_eq!(outcome, LifecycleOutcome::Deleted);
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite3").await.expect("fetch");
+        assert!(fetched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_acknowledge_nonexistent_returns_not_found() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let outcome = store
+            .acknowledge("amp:did:key:z6MkMissing", "no-such-id")
+            .await
+            .expect("ack");
+        assert_eq!(outcome, LifecycleOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_cleanup_removes_expired() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut expired = sample_envelope("amp:did:key:z6MkSqlite4");
+        expired.expires_at = Some(Utc::now() - Duration::seconds(10));
+        let fresh = sample_envelope("amp:did:key:z6MkSqlite4");
+        store.store(&expired).await.expect("store expired");
+        store.store(&fresh).await.expect("store fresh");
+
+        let report = store.cleanup().await.expect("cleanup");
+        assert_eq!(report.expired_removed, 1);
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite4").await.expect("fetch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].envelope_id.0, fresh.envelope_id.0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_identity_round_trip() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let doc = sample_identity_doc("amp:did:key:z6MkIdentity");
+        store.store_identity(&doc).await.expect("store identity");
+
+        let fetched = store
+            .fetch_identity("amp:did:key:z6MkIdentity")
+            .await
+            .expect("fetch identity")
+            .expect("should be Some");
+        assert_eq!(fetched.identity_id.0, "amp:did:key:z6MkIdentity");
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_identity_returns_none_for_missing() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let result = store
+            .fetch_identity("amp:did:key:z6MkNotStored")
+            .await
+            .expect("fetch");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_fetch_skips_expired() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut expired = sample_envelope("amp:did:key:z6MkExpiry");
+        expired.expires_at = Some(Utc::now() - Duration::seconds(5));
+        store.store(&expired).await.expect("store");
+
+        let fetched = store.fetch("amp:did:key:z6MkExpiry").await.expect("fetch");
+        assert!(
+            fetched.is_empty(),
+            "expired envelope should not be returned"
+        );
     }
 }
