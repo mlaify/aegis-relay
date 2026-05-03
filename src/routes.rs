@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aegis_api_types::{
     EnvelopeLifecycleResponse, FetchEnvelopeResponse, RelayCleanupResponse, RelayError,
-    RelayErrorResponse, StoreEnvelopeRequest, StoreEnvelopeResponse,
+    RelayErrorResponse, RelayStatusResponse, StoreEnvelopeRequest, StoreEnvelopeResponse,
 };
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
@@ -13,16 +13,44 @@ use axum::{
 };
 
 use crate::storage::LifecycleOutcome;
-use crate::AppState;
+use crate::{audit::AuditEvent, config::AuthMode, AppState};
 
 pub async fn healthz() -> &'static str {
     "ok"
 }
 
+pub async fn status(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.metrics().await {
+        Ok(m) => Json(RelayStatusResponse {
+            envelopes_total: m.envelopes_total,
+            envelopes_acknowledged: m.envelopes_acknowledged,
+            envelopes_active: m.envelopes_active,
+            identities_total: m.identities_total,
+            auth_mode: match state.auth.mode {
+                AuthMode::Open => "open".to_string(),
+                AuthMode::Token => "token".to_string(),
+            },
+            require_token_for_push: state.auth.require_token_for_push,
+            require_token_for_identity_put: state.auth.require_token_for_identity_put,
+        })
+        .into_response(),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            "failed to fetch relay status",
+        ),
+    }
+}
+
 pub async fn store_envelope(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     payload: Result<Json<StoreEnvelopeRequest>, JsonRejection>,
 ) -> Response {
+    if let Err(err) = require_auth(&state, &headers, AuthScope::PushEnvelope) {
+        return err.into_response();
+    }
+
     let Json(req) = match payload {
         Ok(req) => req,
         Err(err) => {
@@ -127,16 +155,30 @@ pub async fn acknowledge_envelope(
     headers: HeaderMap,
     Path((recipient_id, envelope_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(err) = require_lifecycle_token(&state, &headers) {
+    if let Err(err) = require_auth(&state, &headers, AuthScope::LifecycleChange) {
         return err.into_response();
     }
     match state.store.acknowledge(&recipient_id, &envelope_id).await {
-        Ok(LifecycleOutcome::Acknowledged) => Json(EnvelopeLifecycleResponse {
-            recipient_id,
-            envelope_id,
-            status: "acknowledged".to_string(),
-        })
-        .into_response(),
+        Ok(LifecycleOutcome::Acknowledged) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "acknowledge_envelope",
+                    outcome: "ok",
+                    recipient_id: Some(&recipient_id),
+                    envelope_id: Some(&envelope_id),
+                    identity_id: None,
+                    detail: None,
+                })
+                .await;
+            Json(EnvelopeLifecycleResponse {
+                recipient_id,
+                envelope_id,
+                status: "acknowledged".to_string(),
+            })
+            .into_response()
+        }
         Ok(LifecycleOutcome::NotFound) => {
             error_response(StatusCode::NOT_FOUND, "not_found", "envelope not found")
         }
@@ -158,16 +200,30 @@ pub async fn delete_envelope(
     headers: HeaderMap,
     Path((recipient_id, envelope_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(err) = require_lifecycle_token(&state, &headers) {
+    if let Err(err) = require_auth(&state, &headers, AuthScope::LifecycleChange) {
         return err.into_response();
     }
     match state.store.delete(&recipient_id, &envelope_id).await {
-        Ok(LifecycleOutcome::Deleted) => Json(EnvelopeLifecycleResponse {
-            recipient_id,
-            envelope_id,
-            status: "deleted".to_string(),
-        })
-        .into_response(),
+        Ok(LifecycleOutcome::Deleted) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "delete_envelope",
+                    outcome: "ok",
+                    recipient_id: Some(&recipient_id),
+                    envelope_id: Some(&envelope_id),
+                    identity_id: None,
+                    detail: None,
+                })
+                .await;
+            Json(EnvelopeLifecycleResponse {
+                recipient_id,
+                envelope_id,
+                status: "deleted".to_string(),
+            })
+            .into_response()
+        }
         Ok(LifecycleOutcome::NotFound) => {
             error_response(StatusCode::NOT_FOUND, "not_found", "envelope not found")
         }
@@ -185,13 +241,14 @@ pub async fn delete_envelope(
 }
 
 pub async fn cleanup_store(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(err) = require_lifecycle_token(&state, &headers) {
+    if let Err(err) = require_auth(&state, &headers, AuthScope::LifecycleChange) {
         return err.into_response();
     }
-    match state.store.cleanup().await {
+    match state.store.cleanup(&state.retention).await {
         Ok(report) => Json(RelayCleanupResponse {
             expired_removed: report.expired_removed,
             orphan_ack_removed: report.orphan_ack_removed,
+            old_removed: report.old_removed,
         })
         .into_response(),
         Err(_) => error_response(
@@ -202,29 +259,49 @@ pub async fn cleanup_store(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
 }
 
-fn require_lifecycle_token(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScope {
+    PushEnvelope,
+    IdentityWrite,
+    LifecycleChange,
+}
+
+pub fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
+    scope: AuthScope,
 ) -> Result<(), LifecycleAuthError> {
-    let Some(required) = state.capability_token.as_deref() else {
+    if state.auth.mode == AuthMode::Open {
         return Ok(());
-    };
+    }
+
+    if scope == AuthScope::PushEnvelope && !state.auth.require_token_for_push {
+        return Ok(());
+    }
+    if scope == AuthScope::IdentityWrite && !state.auth.require_token_for_identity_put {
+        return Ok(());
+    }
 
     let provided = token_from_headers(headers);
-    match provided {
-        Some(token) if token == required => Ok(()),
-        Some(_) => Err(LifecycleAuthError::Forbidden),
-        None => Err(LifecycleAuthError::Unauthorized),
+    if provided.is_none() {
+        return Err(LifecycleAuthError::Unauthorized);
+    }
+    let provided = provided.unwrap();
+
+    if state.auth.tokens.iter().any(|t| t == &provided) {
+        Ok(())
+    } else {
+        Err(LifecycleAuthError::Forbidden)
     }
 }
 
-enum LifecycleAuthError {
+pub enum LifecycleAuthError {
     Unauthorized,
     Forbidden,
 }
 
 impl LifecycleAuthError {
-    fn into_response(self) -> Response {
+    pub fn into_response(self) -> Response {
         match self {
             Self::Unauthorized => error_response(
                 StatusCode::UNAUTHORIZED,
@@ -282,19 +359,42 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
-    use crate::storage::SqliteStore;
     use crate::AppState;
+    use crate::{
+        audit::AuditSink,
+        config::{AuthMode, RelayAuthConfig, RetentionPolicy},
+        storage::SqliteStore,
+    };
 
     async fn test_app(token: Option<&str>) -> Router {
+        test_app_with_config(token, false).await
+    }
+
+    async fn test_app_with_config(token: Option<&str>, require_token_for_push: bool) -> Router {
         let store = SqliteStore::open_in_memory()
             .await
             .expect("sqlite in-memory");
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            capability_token: token.map(|t| t.to_string()),
+            auth: RelayAuthConfig {
+                mode: if token.is_some() {
+                    AuthMode::Token
+                } else {
+                    AuthMode::Open
+                },
+                tokens: token.map(|t| vec![t.to_string()]).unwrap_or_default(),
+                require_token_for_push,
+                require_token_for_identity_put: true,
+            },
+            retention: RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            },
+            audit: AuditSink::new(None),
         });
         Router::new()
             .route("/healthz", get(super::healthz))
+            .route("/v1/status", get(super::status))
             .route("/v1/envelopes", post(super::store_envelope))
             .route("/v1/envelopes/:recipient_id", get(super::fetch_envelopes))
             .route(
@@ -357,7 +457,17 @@ mod tests {
         let store = FileStore::new("/dev/null/aegis-relay-storage-fail");
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            capability_token: None,
+            auth: RelayAuthConfig {
+                mode: AuthMode::Open,
+                tokens: vec![],
+                require_token_for_push: false,
+                require_token_for_identity_put: true,
+            },
+            retention: RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            },
+            audit: AuditSink::new(None),
         });
         let app = Router::new()
             .route("/v1/envelopes", post(super::store_envelope))
@@ -645,5 +755,72 @@ mod tests {
             .await
             .expect("cleanup response");
         assert_eq!(valid_token_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn push_route_requires_token_when_configured_and_enabled() {
+        let app = test_app_with_config(Some("dev-token"), true).await;
+
+        let envelope_json = r#"{
+          "envelope": {
+            "version": 1,
+            "envelope_id": "550e8400-e29b-41d4-a716-446655440010",
+            "recipient_id": "amp:did:key:z6MkRecipient",
+            "sender_hint": null,
+            "created_at": "2026-01-02T03:04:05Z",
+            "expires_at": null,
+            "content_type": "message/private",
+            "suite_id": "DemoXChaCha20Poly1305",
+            "used_prekey_ids": [],
+            "payload": {
+              "nonce_b64": "bm9uY2U=",
+              "ciphertext_b64": "Y2lwaGVydGV4dA=="
+            },
+            "outer_signature_b64": null
+          }
+        }"#;
+
+        let missing_token_req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_json))
+            .expect("push request");
+        let missing_token_resp = app
+            .clone()
+            .oneshot(missing_token_req)
+            .await
+            .expect("push response");
+        assert_eq!(missing_token_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let valid_token_req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("authorization", "Bearer dev-token")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_json))
+            .expect("push request");
+        let valid_token_resp = app.oneshot(valid_token_req).await.expect("push response");
+        assert_eq!(valid_token_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_returns_metrics() {
+        let app = test_app(None).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/status")
+            .body(Body::empty())
+            .expect("status request");
+        let resp = app.oneshot(req).await.expect("status response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["auth_mode"], "open");
+        assert!(json["envelopes_total"].is_number());
     }
 }
