@@ -1,23 +1,28 @@
+mod identity_routes;
 mod routes;
 mod storage;
 
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
-use storage::FileStore;
+use storage::{SqliteStore, Store};
 
 pub struct AppState {
-    pub store: Arc<FileStore>,
+    pub store: Arc<dyn Store>,
     pub capability_token: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
+    let db_path = std::env::var("AEGIS_DB_PATH").unwrap_or_else(|_| "aegis-relay.db".to_string());
+    let store = SqliteStore::open(&db_path)
+        .await
+        .expect("failed to open SQLite store");
     let state = Arc::new(AppState {
-        store: Arc::new(FileStore::new("./data")),
+        store: Arc::new(store),
         capability_token: std::env::var("AEGIS_RELAY_CAPABILITY_TOKEN").ok(),
     });
     let app = Router::new()
@@ -33,6 +38,14 @@ async fn main() {
             delete(routes::delete_envelope),
         )
         .route("/v1/cleanup", post(routes::cleanup_store))
+        .route(
+            "/v1/identities/:identity_id",
+            get(identity_routes::get_identity),
+        )
+        .route(
+            "/v1/identities/:identity_id",
+            put(identity_routes::put_identity),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8787));

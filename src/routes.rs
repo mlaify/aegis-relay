@@ -282,12 +282,15 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
-    use crate::storage::FileStore;
+    use crate::storage::SqliteStore;
     use crate::AppState;
 
-    fn test_app(store_path: &str, token: Option<&str>) -> Router {
+    async fn test_app(token: Option<&str>) -> Router {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("sqlite in-memory");
         let state = Arc::new(AppState {
-            store: Arc::new(FileStore::new(store_path)),
+            store: Arc::new(store),
             capability_token: token.map(|t| t.to_string()),
         });
         Router::new()
@@ -308,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_envelope_returns_structured_bad_request_for_malformed_json() {
-        let app = test_app("./data-test-routes-malformed", None);
+        let app = test_app(None).await;
 
         let req = Request::builder()
             .method("POST")
@@ -329,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_envelopes_returns_empty_list_for_missing_recipient() {
-        let app = test_app("./data-test-routes-empty", None);
+        let app = test_app(None).await;
 
         let req = Request::builder()
             .method("GET")
@@ -349,8 +352,16 @@ mod tests {
 
     #[tokio::test]
     async fn store_envelope_returns_structured_storage_error_on_write_failure() {
-        // `/dev/null` is a file, so trying to create a directory under it will fail.
-        let app = test_app("/dev/null/aegis-relay-storage-fail", None);
+        // Use FileStore with an impossible path to force a storage error.
+        use crate::storage::FileStore;
+        let store = FileStore::new("/dev/null/aegis-relay-storage-fail");
+        let state = Arc::new(AppState {
+            store: Arc::new(store),
+            capability_token: None,
+        });
+        let app = Router::new()
+            .route("/v1/envelopes", post(super::store_envelope))
+            .with_state(state);
 
         let req = Request::builder()
             .method("POST")
@@ -391,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_envelope_rejects_structurally_invalid_envelope() {
-        let app = test_app("./data-test-routes-invalid-envelope", None);
+        let app = test_app(None).await;
 
         let req = Request::builder()
             .method("POST")
@@ -431,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn acknowledge_and_delete_endpoints_return_lifecycle_responses() {
-        let app = test_app("./data-test-routes-lifecycle", None);
+        let app = test_app(None).await;
 
         let envelope_json = r#"{
           "envelope": {
@@ -494,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_routes_require_token_when_configured() {
-        let app = test_app("./data-test-routes-lifecycle-token", Some("dev-token"));
+        let app = test_app(Some("dev-token")).await;
 
         let envelope_json = r#"{
           "envelope": {
@@ -565,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_routes_remain_open_without_configured_token() {
-        let app = test_app("./data-test-routes-lifecycle-open", None);
+        let app = test_app(None).await;
 
         let envelope_json = r#"{
           "envelope": {
@@ -609,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_route_requires_token_when_configured() {
-        let app = test_app("./data-test-routes-cleanup-token", Some("dev-token"));
+        let app = test_app(Some("dev-token")).await;
 
         let missing_token_req = Request::builder()
             .method("POST")
