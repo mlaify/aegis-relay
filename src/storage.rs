@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::config::RetentionPolicy;
 use aegis_proto::{Envelope, IdentityDocument};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,6 +18,15 @@ pub enum LifecycleOutcome {
 pub struct CleanupReport {
     pub expired_removed: usize,
     pub orphan_ack_removed: usize,
+    pub old_removed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayMetrics {
+    pub envelopes_total: usize,
+    pub envelopes_acknowledged: usize,
+    pub envelopes_active: usize,
+    pub identities_total: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +53,10 @@ pub trait Store: Send + Sync {
         recipient_id: &str,
         envelope_id: &str,
     ) -> Result<LifecycleOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>>;
+    async fn cleanup(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>>;
     async fn store_identity(
         &self,
         doc: &IdentityDocument,
@@ -56,6 +69,7 @@ pub trait Store: Send + Sync {
         &self,
         alias: &str,
     ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,10 +192,14 @@ impl Store for FileStore {
         Ok(LifecycleOutcome::Deleted)
     }
 
-    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+    async fn cleanup(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
         let mut report = CleanupReport {
             expired_removed: 0,
             orphan_ack_removed: 0,
+            old_removed: 0,
         };
         if !tokio::fs::try_exists(&self.base).await? {
             return Ok(report);
@@ -203,6 +221,15 @@ impl Store for FileStore {
                         if is_expired(&envelope) {
                             let _ = tokio::fs::remove_file(&path).await;
                             report.expired_removed += 1;
+                            continue;
+                        }
+                        if let Some(max_age_days) = policy.max_message_age_days {
+                            if envelope.created_at
+                                <= (Utc::now() - chrono::Duration::days(max_age_days))
+                            {
+                                let _ = tokio::fs::remove_file(&path).await;
+                                report.old_removed += 1;
+                            }
                         }
                     }
                     Some("ack") => {
@@ -275,6 +302,48 @@ impl Store for FileStore {
         }
 
         Ok(None)
+    }
+
+    async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>> {
+        let mut envelopes_total = 0usize;
+        let mut envelopes_acknowledged = 0usize;
+        let mut identities_total = 0usize;
+
+        if tokio::fs::try_exists(&self.base).await? {
+            let mut recipient_dirs = tokio::fs::read_dir(&self.base).await?;
+            while let Some(recipient_entry) = recipient_dirs.next_entry().await? {
+                let recipient_path = recipient_entry.path();
+                if !recipient_path.is_dir() {
+                    continue;
+                }
+                if recipient_path.file_name().and_then(|v| v.to_str()) == Some("identities") {
+                    let mut identity_files = tokio::fs::read_dir(&recipient_path).await?;
+                    while let Some(identity_entry) = identity_files.next_entry().await? {
+                        let path = identity_entry.path();
+                        if path.extension().and_then(|v| v.to_str()) == Some("json") {
+                            identities_total += 1;
+                        }
+                    }
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(&recipient_path).await?;
+                while let Some(file_entry) = files.next_entry().await? {
+                    let path = file_entry.path();
+                    if path.extension().and_then(|v| v.to_str()) == Some("json") {
+                        envelopes_total += 1;
+                    } else if path.extension().and_then(|v| v.to_str()) == Some("ack") {
+                        envelopes_acknowledged += 1;
+                    }
+                }
+            }
+        }
+        let envelopes_active = envelopes_total.saturating_sub(envelopes_acknowledged);
+        Ok(RelayMetrics {
+            envelopes_total,
+            envelopes_acknowledged,
+            envelopes_active,
+            identities_total,
+        })
     }
 }
 
@@ -428,22 +497,41 @@ impl Store for SqliteStore {
         })
     }
 
-    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
-        let (expired_removed, orphan_ack_removed) = self
+    async fn cleanup(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+        let max_age_days = policy.max_message_age_days;
+        let purge_acked = policy.purge_acknowledged_on_cleanup;
+        let (expired_removed, orphan_ack_removed, old_removed) = self
             .conn
-            .call(|c| {
+            .call(move |c| {
                 let expired = c.execute(
                     "DELETE FROM envelopes \
                      WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')",
                     [],
                 )?;
-                let acked = c.execute("DELETE FROM envelopes WHERE acknowledged = 1", [])?;
-                Ok((expired, acked))
+                let acked = if purge_acked {
+                    c.execute("DELETE FROM envelopes WHERE acknowledged = 1", [])?
+                } else {
+                    0
+                };
+                let old = if let Some(days) = max_age_days {
+                    c.execute(
+                        "DELETE FROM envelopes
+                         WHERE datetime(json_extract(envelope_json, '$.created_at')) <= datetime('now', ?1)",
+                        rusqlite::params![format!("-{} days", days)],
+                    )?
+                } else {
+                    0
+                };
+                Ok((expired, acked, old))
             })
             .await?;
         Ok(CleanupReport {
             expired_removed,
             orphan_ack_removed,
+            old_removed,
         })
     }
 
@@ -516,6 +604,34 @@ impl Store for SqliteStore {
 
         Ok(None)
     }
+
+    async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>> {
+        let (envelopes_total, envelopes_acknowledged, envelopes_active, identities_total) = self
+            .conn
+            .call(|c| {
+                let total: i64 = c.query_row("SELECT COUNT(*) FROM envelopes", [], |r| r.get(0))?;
+                let acked: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM envelopes WHERE acknowledged = 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let active: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM envelopes WHERE acknowledged = 0",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let identities: i64 =
+                    c.query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0))?;
+                Ok((total, acked, active, identities))
+            })
+            .await?;
+        Ok(RelayMetrics {
+            envelopes_total: envelopes_total as usize,
+            envelopes_acknowledged: envelopes_acknowledged as usize,
+            envelopes_active: envelopes_active as usize,
+            identities_total: identities_total as usize,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +659,7 @@ fn is_expired(envelope: &Envelope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{FileStore, LifecycleOutcome, SqliteStore, Store};
+    use crate::config::RetentionPolicy;
     use aegis_proto::{
         EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
     };
@@ -655,7 +772,13 @@ mod tests {
             .await
             .expect("write orphan ack");
 
-        let report = store.cleanup().await.expect("cleanup");
+        let report = store
+            .cleanup(&RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            })
+            .await
+            .expect("cleanup");
         assert_eq!(report.expired_removed, 1);
         assert_eq!(report.orphan_ack_removed, 1);
 
@@ -757,7 +880,13 @@ mod tests {
         store.store(&expired).await.expect("store expired");
         store.store(&fresh).await.expect("store fresh");
 
-        let report = store.cleanup().await.expect("cleanup");
+        let report = store
+            .cleanup(&RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            })
+            .await
+            .expect("cleanup");
         assert_eq!(report.expired_removed, 1);
 
         let fetched = store.fetch("amp:did:key:z6MkSqlite4").await.expect("fetch");

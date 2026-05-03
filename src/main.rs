@@ -1,3 +1,5 @@
+mod audit;
+mod config;
 mod identity_routes;
 mod routes;
 mod storage;
@@ -8,29 +10,35 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use config::{RelayAuthConfig, RelayConfig, RetentionPolicy};
 use storage::{SqliteStore, Store};
 
 pub struct AppState {
     pub store: Arc<dyn Store>,
-    pub capability_token: Option<String>,
+    pub auth: RelayAuthConfig,
+    pub retention: RetentionPolicy,
+    pub audit: audit::AuditSink,
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let db_path = std::env::var("AEGIS_DB_PATH").unwrap_or_else(|_| "aegis-relay.db".to_string());
-    let store = SqliteStore::open(&db_path)
+    let cfg = RelayConfig::from_env();
+    let store = SqliteStore::open(&cfg.db_path)
         .await
         .expect("failed to open SQLite store");
 
     let state = Arc::new(AppState {
         store: Arc::new(store),
-        capability_token: std::env::var("AEGIS_RELAY_CAPABILITY_TOKEN").ok(),
+        auth: cfg.auth.clone(),
+        retention: cfg.retention.clone(),
+        audit: audit::AuditSink::new(cfg.audit_log_path.clone()),
     });
 
     let app = Router::new()
         .route("/healthz", get(routes::healthz))
+        .route("/v1/status", get(routes::status))
         .route("/v1/envelopes", post(routes::store_envelope))
         .route("/v1/envelopes/:recipient_id", get(routes::fetch_envelopes))
         .route(
@@ -53,8 +61,7 @@ async fn main() {
         .route("/v1/aliases/:alias", get(identity_routes::get_alias))
         .with_state(state);
 
-    let bind = std::env::var("AEGIS_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
-    let addr: SocketAddr = bind.parse().expect("invalid AEGIS_RELAY_BIND address");
+    let addr: SocketAddr = cfg.bind.parse().expect("invalid AEGIS_RELAY_BIND address");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::info!("aegis-relay listening on http://{}", addr);
     axum::serve(listener, app).await.unwrap();

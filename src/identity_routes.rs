@@ -5,19 +5,29 @@ use aegis_identity::{verify_identity_document_signature, ALG_ED25519, ALG_MLDSA6
 use aegis_proto::IdentityDocument;
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
+    http::HeaderMap,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-use crate::AppState;
+use crate::{
+    audit::AuditEvent,
+    routes::{require_auth, AuthScope},
+    AppState,
+};
 
 pub async fn put_identity(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(identity_id): Path<String>,
     payload: Result<Json<IdentityDocument>, JsonRejection>,
 ) -> Response {
+    if let Err(err) = require_auth(&state, &headers, AuthScope::IdentityWrite) {
+        return err.into_response();
+    }
+
     let Json(doc) = match payload {
         Ok(doc) => doc,
         Err(err) => {
@@ -39,7 +49,21 @@ pub async fn put_identity(
     }
 
     match state.store.store_identity(&doc).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "put_identity",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: None,
+                    identity_id: Some(&identity_id),
+                    detail: None,
+                })
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => internal_error("storage_error", "failed to store identity"),
     }
 }
@@ -157,16 +181,38 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use tower::util::ServiceExt;
 
-    use crate::storage::SqliteStore;
     use crate::AppState;
+    use crate::{
+        audit::AuditSink,
+        config::{AuthMode, RelayAuthConfig, RetentionPolicy},
+        storage::SqliteStore,
+    };
 
     async fn test_app() -> Router {
+        test_app_with_token(None).await
+    }
+
+    async fn test_app_with_token(token: Option<&str>) -> Router {
         let store = SqliteStore::open_in_memory()
             .await
             .expect("sqlite in-memory");
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            capability_token: None,
+            auth: RelayAuthConfig {
+                mode: if token.is_some() {
+                    AuthMode::Token
+                } else {
+                    AuthMode::Open
+                },
+                tokens: token.map(|t| vec![t.to_string()]).unwrap_or_default(),
+                require_token_for_push: false,
+                require_token_for_identity_put: true,
+            },
+            retention: RetentionPolicy {
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            },
+            audit: AuditSink::new(None),
         });
         Router::new()
             .route("/v1/identities/:identity_id", put(super::put_identity))
@@ -236,6 +282,32 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn put_identity_requires_token_when_configured() {
+        let app = test_app_with_token(Some("dev-token")).await;
+        let doc = make_signed_doc("amp:did:key:z6MkProtected");
+        let body = serde_json::to_string(&doc).unwrap();
+
+        let missing_req = Request::builder()
+            .method("PUT")
+            .uri("/v1/identities/amp:did:key:z6MkProtected")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let missing_resp = app.clone().oneshot(missing_req).await.unwrap();
+        assert_eq!(missing_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let valid_req = Request::builder()
+            .method("PUT")
+            .uri("/v1/identities/amp:did:key:z6MkProtected")
+            .header("authorization", "Bearer dev-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let valid_resp = app.oneshot(valid_req).await.unwrap();
+        assert_eq!(valid_resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
