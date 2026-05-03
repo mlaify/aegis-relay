@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use aegis_proto::Envelope;
+use aegis_proto::{Envelope, IdentityDocument};
+use async_trait::async_trait;
 use chrono::Utc;
-
-pub struct FileStore {
-    base: PathBuf,
-}
+use rusqlite::OptionalExtension;
+use tokio_rusqlite::Connection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleOutcome {
@@ -20,14 +19,78 @@ pub struct CleanupReport {
     pub orphan_ack_removed: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Store trait
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait Store: Send + Sync {
+    async fn store(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn fetch(
+        &self,
+        recipient_id: &str,
+    ) -> Result<Vec<Envelope>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn acknowledge(
+        &self,
+        recipient_id: &str,
+        envelope_id: &str,
+    ) -> Result<LifecycleOutcome, Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete(
+        &self,
+        recipient_id: &str,
+        envelope_id: &str,
+    ) -> Result<LifecycleOutcome, Box<dyn std::error::Error + Send + Sync>>;
+    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>>;
+    async fn store_identity(
+        &self,
+        doc: &IdentityDocument,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn fetch_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn resolve_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+// ---------------------------------------------------------------------------
+// FileStore
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub struct FileStore {
+    base: PathBuf,
+}
+
 impl FileStore {
+    #[allow(dead_code)]
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
             base: path.as_ref().to_path_buf(),
         }
     }
 
-    pub async fn store(
+    fn envelope_path(&self, recipient_id: &str, envelope_id: &str) -> PathBuf {
+        self.base
+            .join(safe_name(recipient_id))
+            .join(format!("{envelope_id}.json"))
+    }
+
+    fn ack_path(&self, recipient_id: &str, envelope_id: &str) -> PathBuf {
+        self.base
+            .join(safe_name(recipient_id))
+            .join(format!("{envelope_id}.ack"))
+    }
+}
+
+#[async_trait]
+impl Store for FileStore {
+    async fn store(
         &self,
         envelope: &Envelope,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -39,7 +102,7 @@ impl FileStore {
         Ok(())
     }
 
-    pub async fn fetch(
+    async fn fetch(
         &self,
         recipient_id: &str,
     ) -> Result<Vec<Envelope>, Box<dyn std::error::Error + Send + Sync>> {
@@ -79,7 +142,7 @@ impl FileStore {
         Ok(out)
     }
 
-    pub async fn acknowledge(
+    async fn acknowledge(
         &self,
         recipient_id: &str,
         envelope_id: &str,
@@ -97,7 +160,7 @@ impl FileStore {
         Ok(LifecycleOutcome::Acknowledged)
     }
 
-    pub async fn delete(
+    async fn delete(
         &self,
         recipient_id: &str,
         envelope_id: &str,
@@ -115,7 +178,7 @@ impl FileStore {
         Ok(LifecycleOutcome::Deleted)
     }
 
-    pub async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
         let mut report = CleanupReport {
             expired_removed: 0,
             orphan_ack_removed: 0,
@@ -164,23 +227,307 @@ impl FileStore {
         Ok(report)
     }
 
-    fn envelope_path(&self, recipient_id: &str, envelope_id: &str) -> PathBuf {
-        self.base
-            .join(safe_name(recipient_id))
-            .join(format!("{envelope_id}.json"))
+    async fn store_identity(
+        &self,
+        doc: &IdentityDocument,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dir = self.base.join("identities");
+        tokio::fs::create_dir_all(&dir).await?;
+        let safe = safe_name(&doc.identity_id.0);
+        let path = dir.join(format!("{safe}.json"));
+        tokio::fs::write(path, serde_json::to_vec_pretty(doc)?).await?;
+        Ok(())
     }
 
-    fn ack_path(&self, recipient_id: &str, envelope_id: &str) -> PathBuf {
-        self.base
-            .join(safe_name(recipient_id))
-            .join(format!("{envelope_id}.ack"))
+    async fn fetch_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
+        let dir = self.base.join("identities");
+        let path = dir.join(format!("{}.json", safe_name(identity_id)));
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(path).await?;
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    async fn resolve_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
+        let dir = self.base.join("identities");
+        if !tokio::fs::try_exists(&dir).await? {
+            return Ok(None);
+        }
+
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = tokio::fs::read_to_string(path).await?;
+            let doc: IdentityDocument = serde_json::from_str(&raw)?;
+            if doc.aliases.iter().any(|a| a == alias) {
+                return Ok(Some(doc));
+            }
+        }
+
+        Ok(None)
     }
 }
 
+// ---------------------------------------------------------------------------
+// SqliteStore
+// ---------------------------------------------------------------------------
+
+const MIGRATIONS: &str = "
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS envelopes (
+        envelope_id TEXT PRIMARY KEY,
+        recipient_id TEXT NOT NULL,
+        envelope_json TEXT NOT NULL,
+        expires_at TEXT,
+        acknowledged INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_envelopes_recipient
+        ON envelopes(recipient_id);
+    CREATE TABLE IF NOT EXISTS identities (
+        identity_id TEXT PRIMARY KEY,
+        identity_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+";
+
+pub struct SqliteStore {
+    conn: Connection,
+}
+
+impl SqliteStore {
+    pub async fn open(path: &str) -> Result<Self, tokio_rusqlite::Error> {
+        let conn = Connection::open(path).await?;
+        conn.call(|c| c.execute_batch(MIGRATIONS).map_err(|e| e.into()))
+            .await?;
+        Ok(Self { conn })
+    }
+
+    #[allow(dead_code)]
+    pub async fn open_in_memory() -> Result<Self, tokio_rusqlite::Error> {
+        let conn = Connection::open_in_memory().await?;
+        conn.call(|c| c.execute_batch(MIGRATIONS).map_err(|e| e.into()))
+            .await?;
+        Ok(Self { conn })
+    }
+}
+
+#[async_trait]
+impl Store for SqliteStore {
+    async fn store(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(envelope)?;
+        let envelope_id = envelope.envelope_id.0.to_string();
+        let recipient_id = envelope.recipient_id.0.clone();
+        // Store in SQLite datetime format ("YYYY-MM-DD HH:MM:SS" UTC) so that
+        // comparisons against datetime('now') work as plain string comparisons.
+        let expires_at = envelope
+            .expires_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT OR REPLACE INTO envelopes \
+                     (envelope_id, recipient_id, envelope_json, expires_at, acknowledged) \
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    rusqlite::params![envelope_id, recipient_id, json, expires_at],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn fetch(
+        &self,
+        recipient_id: &str,
+    ) -> Result<Vec<Envelope>, Box<dyn std::error::Error + Send + Sync>> {
+        let recipient_id = recipient_id.to_string();
+        let rows: Vec<String> = self
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT envelope_json FROM envelopes \
+                     WHERE recipient_id = ?1 AND acknowledged = 0 \
+                     AND (expires_at IS NULL OR expires_at > datetime('now'))",
+                )?;
+                let result = stmt
+                    .query_map(rusqlite::params![recipient_id], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e: rusqlite::Error| e.into());
+                result
+            })
+            .await?;
+        rows.into_iter()
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            })
+            .collect()
+    }
+
+    async fn acknowledge(
+        &self,
+        recipient_id: &str,
+        envelope_id: &str,
+    ) -> Result<LifecycleOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let recipient_id = recipient_id.to_string();
+        let envelope_id = envelope_id.to_string();
+        let rows_changed = self
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE envelopes SET acknowledged = 1 \
+                     WHERE envelope_id = ?1 AND recipient_id = ?2",
+                    rusqlite::params![envelope_id, recipient_id],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(if rows_changed == 0 {
+            LifecycleOutcome::NotFound
+        } else {
+            LifecycleOutcome::Acknowledged
+        })
+    }
+
+    async fn delete(
+        &self,
+        recipient_id: &str,
+        envelope_id: &str,
+    ) -> Result<LifecycleOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let recipient_id = recipient_id.to_string();
+        let envelope_id = envelope_id.to_string();
+        let rows_changed = self
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "DELETE FROM envelopes WHERE envelope_id = ?1 AND recipient_id = ?2",
+                    rusqlite::params![envelope_id, recipient_id],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(if rows_changed == 0 {
+            LifecycleOutcome::NotFound
+        } else {
+            LifecycleOutcome::Deleted
+        })
+    }
+
+    async fn cleanup(&self) -> Result<CleanupReport, Box<dyn std::error::Error + Send + Sync>> {
+        let (expired_removed, orphan_ack_removed) = self
+            .conn
+            .call(|c| {
+                let expired = c.execute(
+                    "DELETE FROM envelopes \
+                     WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')",
+                    [],
+                )?;
+                let acked = c.execute("DELETE FROM envelopes WHERE acknowledged = 1", [])?;
+                Ok((expired, acked))
+            })
+            .await?;
+        Ok(CleanupReport {
+            expired_removed,
+            orphan_ack_removed,
+        })
+    }
+
+    async fn store_identity(
+        &self,
+        doc: &IdentityDocument,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let identity_id = doc.identity_id.0.clone();
+        let json = serde_json::to_string(doc)?;
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT OR REPLACE INTO identities \
+                     (identity_id, identity_json, updated_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![identity_id, json, updated_at],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn fetch_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
+        let identity_id = identity_id.to_string();
+        let result: Option<String> = self
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT identity_json FROM identities WHERE identity_id = ?1",
+                    rusqlite::params![identity_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.into())
+            })
+            .await?;
+        match result {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn resolve_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
+        let alias = alias.to_string();
+        let rows: Vec<String> = self
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT identity_json FROM identities")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.into());
+                rows
+            })
+            .await?;
+
+        for json in rows {
+            let doc: IdentityDocument = serde_json::from_str(&json)?;
+            if doc.aliases.iter().any(|a| a == &alias) {
+                return Ok(Some(doc));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 fn safe_name(input: &str) -> String {
     input.replace([':', '/'], "_")
 }
 
+#[allow(dead_code)]
 fn is_expired(envelope: &Envelope) -> bool {
     envelope
         .expires_at
@@ -189,10 +536,16 @@ fn is_expired(envelope: &Envelope) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    use super::{FileStore, LifecycleOutcome};
-    use aegis_proto::{EncryptedBlob, Envelope, IdentityId, SuiteId};
+    use super::{FileStore, LifecycleOutcome, SqliteStore, Store};
+    use aegis_proto::{
+        EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
+    };
     use chrono::{Duration, Utc};
 
     fn sample_envelope(recipient: &str) -> Envelope {
@@ -307,5 +660,172 @@ mod tests {
         assert_eq!(report.orphan_ack_removed, 1);
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // SqliteStore tests
+    // -----------------------------------------------------------------------
+
+    fn sample_identity_doc(id: &str) -> IdentityDocument {
+        IdentityDocument {
+            version: 1,
+            identity_id: IdentityId(id.to_string()),
+            aliases: vec![],
+            signing_keys: vec![PublicKeyRecord {
+                key_id: "sig-1".to_string(),
+                algorithm: "AMP-ED25519-V1".to_string(),
+                public_key_b64: "c2lnbmluZ2tleQ==".to_string(),
+            }],
+            encryption_keys: vec![],
+            supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".to_string()],
+            relay_endpoints: vec![],
+            signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_round_trip_envelope() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkSqlite");
+        store.store(&envelope).await.expect("store");
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite").await.expect("fetch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].envelope_id.0, envelope.envelope_id.0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_acknowledge_hides_from_fetch() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkSqlite2");
+        let id = envelope.envelope_id.0.to_string();
+        store.store(&envelope).await.expect("store");
+
+        let outcome = store
+            .acknowledge("amp:did:key:z6MkSqlite2", &id)
+            .await
+            .expect("ack");
+        assert_eq!(outcome, LifecycleOutcome::Acknowledged);
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite2").await.expect("fetch");
+        assert!(fetched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_delete_removes_envelope() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkSqlite3");
+        let id = envelope.envelope_id.0.to_string();
+        store.store(&envelope).await.expect("store");
+
+        let outcome = store
+            .delete("amp:did:key:z6MkSqlite3", &id)
+            .await
+            .expect("delete");
+        assert_eq!(outcome, LifecycleOutcome::Deleted);
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite3").await.expect("fetch");
+        assert!(fetched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_acknowledge_nonexistent_returns_not_found() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let outcome = store
+            .acknowledge("amp:did:key:z6MkMissing", "no-such-id")
+            .await
+            .expect("ack");
+        assert_eq!(outcome, LifecycleOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_cleanup_removes_expired() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut expired = sample_envelope("amp:did:key:z6MkSqlite4");
+        expired.expires_at = Some(Utc::now() - Duration::seconds(10));
+        let fresh = sample_envelope("amp:did:key:z6MkSqlite4");
+        store.store(&expired).await.expect("store expired");
+        store.store(&fresh).await.expect("store fresh");
+
+        let report = store.cleanup().await.expect("cleanup");
+        assert_eq!(report.expired_removed, 1);
+
+        let fetched = store.fetch("amp:did:key:z6MkSqlite4").await.expect("fetch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].envelope_id.0, fresh.envelope_id.0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_identity_round_trip() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let doc = sample_identity_doc("amp:did:key:z6MkIdentity");
+        store.store_identity(&doc).await.expect("store identity");
+
+        let fetched = store
+            .fetch_identity("amp:did:key:z6MkIdentity")
+            .await
+            .expect("fetch identity")
+            .expect("should be Some");
+        assert_eq!(fetched.identity_id.0, "amp:did:key:z6MkIdentity");
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_identity_returns_none_for_missing() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let result = store
+            .fetch_identity("amp:did:key:z6MkNotStored")
+            .await
+            .expect("fetch");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_resolve_alias_returns_matching_identity() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut doc = sample_identity_doc("amp:did:key:z6MkIdentityAlias");
+        doc.aliases = vec!["alice@mesh".to_string()];
+        store.store_identity(&doc).await.expect("store identity");
+
+        let resolved = store
+            .resolve_alias("alice@mesh")
+            .await
+            .expect("resolve alias");
+        assert!(resolved.is_some());
+        assert_eq!(
+            resolved.unwrap().identity_id.0,
+            "amp:did:key:z6MkIdentityAlias"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_fetch_skips_expired() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut expired = sample_envelope("amp:did:key:z6MkExpiry");
+        expired.expires_at = Some(Utc::now() - Duration::seconds(5));
+        store.store(&expired).await.expect("store");
+
+        let fetched = store.fetch("amp:did:key:z6MkExpiry").await.expect("fetch");
+        assert!(
+            fetched.is_empty(),
+            "expired envelope should not be returned"
+        );
     }
 }
