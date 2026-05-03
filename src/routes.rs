@@ -63,11 +63,27 @@ pub async fn store_envelope(
     }
 
     match state.store.store(&req.envelope).await {
-        Ok(()) => Json(StoreEnvelopeResponse {
-            accepted: true,
-            relay_id: "local-relay".to_string(),
-        })
-        .into_response(),
+        Ok(()) => {
+            let recipient_id = req.envelope.recipient_id.0.clone();
+            let envelope_id = req.envelope.envelope_id.0.to_string();
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "store_envelope",
+                    outcome: "ok",
+                    recipient_id: Some(&recipient_id),
+                    envelope_id: Some(&envelope_id),
+                    identity_id: None,
+                    detail: None,
+                })
+                .await;
+            Json(StoreEnvelopeResponse {
+                accepted: true,
+                relay_id: "local-relay".to_string(),
+            })
+            .into_response()
+        }
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "storage_error",

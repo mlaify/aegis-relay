@@ -90,7 +90,22 @@ pub async fn get_identity(
 
 pub async fn get_alias(State(state): State<Arc<AppState>>, Path(alias): Path<String>) -> Response {
     match state.store.resolve_alias(&alias).await {
-        Ok(Some(doc)) => Json(doc).into_response(),
+        Ok(Some(doc)) => {
+            let resolved_id = doc.identity_id.0.clone();
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "resolve_alias",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: None,
+                    identity_id: Some(&resolved_id),
+                    detail: Some(&alias),
+                })
+                .await;
+            Json(doc).into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(RelayErrorResponse {

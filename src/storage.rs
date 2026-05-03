@@ -367,6 +367,13 @@ const MIGRATIONS: &str = "
         identity_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS identity_aliases (
+        alias TEXT NOT NULL,
+        identity_id TEXT NOT NULL,
+        PRIMARY KEY (alias)
+    );
+    CREATE INDEX IF NOT EXISTS idx_identity_aliases_identity_id
+        ON identity_aliases(identity_id);
 ";
 
 pub struct SqliteStore {
@@ -542,14 +549,28 @@ impl Store for SqliteStore {
         let identity_id = doc.identity_id.0.clone();
         let json = serde_json::to_string(doc)?;
         let updated_at = Utc::now().to_rfc3339();
+        let aliases = doc.aliases.clone();
         self.conn
             .call(move |c| {
-                c.execute(
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
                     "INSERT OR REPLACE INTO identities \
                      (identity_id, identity_json, updated_at) VALUES (?1, ?2, ?3)",
                     rusqlite::params![identity_id, json, updated_at],
-                )
-                .map_err(|e| e.into())
+                )?;
+                // Rebuild alias index for this identity atomically.
+                tx.execute(
+                    "DELETE FROM identity_aliases WHERE identity_id = ?1",
+                    rusqlite::params![identity_id],
+                )?;
+                for alias in &aliases {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO identity_aliases (alias, identity_id) \
+                         VALUES (?1, ?2)",
+                        rusqlite::params![alias, identity_id],
+                    )?;
+                }
+                tx.commit().map_err(|e| e.into())
             })
             .await?;
         Ok(())
@@ -583,26 +604,26 @@ impl Store for SqliteStore {
         alias: &str,
     ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
         let alias = alias.to_string();
-        let rows: Vec<String> = self
+        let result: Option<String> = self
             .conn
             .call(move |c| {
-                let mut stmt = c.prepare("SELECT identity_json FROM identities")?;
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.into());
-                rows
+                c.query_row(
+                    "SELECT i.identity_json \
+                     FROM identities i \
+                     JOIN identity_aliases a ON a.identity_id = i.identity_id \
+                     WHERE a.alias = ?1 \
+                     LIMIT 1",
+                    rusqlite::params![alias],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.into())
             })
             .await?;
-
-        for json in rows {
-            let doc: IdentityDocument = serde_json::from_str(&json)?;
-            if doc.aliases.iter().any(|a| a == &alias) {
-                return Ok(Some(doc));
-            }
+        match result {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
         }
-
-        Ok(None)
     }
 
     async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>> {
@@ -940,6 +961,61 @@ mod tests {
             resolved.unwrap().identity_id.0,
             "amp:did:key:z6MkIdentityAlias"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_resolve_alias_returns_none_for_unknown() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let result = store
+            .resolve_alias("nobody@nowhere")
+            .await
+            .expect("resolve");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_alias_index_updated_on_re_publish() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let id = "amp:did:key:z6MkAliasUpdate";
+
+        // First publish: alias "old@mesh"
+        let mut doc = sample_identity_doc(id);
+        doc.aliases = vec!["old@mesh".to_string()];
+        store.store_identity(&doc).await.expect("store v1");
+
+        // Re-publish: alias changed to "new@mesh"
+        doc.aliases = vec!["new@mesh".to_string()];
+        store.store_identity(&doc).await.expect("store v2");
+
+        // Old alias must not resolve any more
+        let old = store.resolve_alias("old@mesh").await.expect("resolve old");
+        assert!(old.is_none(), "stale alias must not resolve after re-publish");
+
+        // New alias must resolve
+        let new = store.resolve_alias("new@mesh").await.expect("resolve new");
+        assert!(new.is_some());
+        assert_eq!(new.unwrap().identity_id.0, id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_multiple_aliases_all_resolve() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let id = "amp:did:key:z6MkMultiAlias";
+        let mut doc = sample_identity_doc(id);
+        doc.aliases = vec!["alice@mesh".to_string(), "alice@example.com".to_string()];
+        store.store_identity(&doc).await.expect("store");
+
+        for alias in &["alice@mesh", "alice@example.com"] {
+            let resolved = store.resolve_alias(alias).await.expect("resolve");
+            assert!(resolved.is_some(), "alias {alias} must resolve");
+            assert_eq!(resolved.unwrap().identity_id.0, id);
+        }
     }
 
     #[tokio::test]
