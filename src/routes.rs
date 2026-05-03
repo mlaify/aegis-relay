@@ -73,6 +73,38 @@ fn validate_envelope(envelope: &aegis_proto::Envelope) -> Result<(), String> {
         return Err("payload.ciphertext_b64 must be non-empty".to_string());
     }
 
+    // Hybrid PQ suite requires KEM transport fields and a PQ signature.
+    if envelope.suite_id == aegis_proto::SuiteId::HybridX25519MlKem768Ed25519MlDsa65 {
+        if envelope
+            .payload
+            .eph_x25519_public_key_b64
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err(
+                "payload.eph_x25519_public_key_b64 required for hybrid PQ suite".to_string(),
+            );
+        }
+        if envelope
+            .payload
+            .mlkem_ciphertext_b64
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err("payload.mlkem_ciphertext_b64 required for hybrid PQ suite".to_string());
+        }
+        if envelope
+            .outer_pq_signature_b64
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err("outer_pq_signature_b64 required for hybrid PQ suite".to_string());
+        }
+    }
+
     Ok(())
 }
 
