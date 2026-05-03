@@ -50,6 +50,7 @@ async fn main() {
             "/v1/identities/:identity_id",
             put(identity_routes::put_identity),
         )
+        .route("/v1/aliases/:alias", get(identity_routes::get_alias))
         .with_state(state);
 
     let bind = std::env::var("AEGIS_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8787".to_string());

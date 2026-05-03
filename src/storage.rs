@@ -52,6 +52,10 @@ pub trait Store: Send + Sync {
         &self,
         identity_id: &str,
     ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn resolve_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +250,31 @@ impl Store for FileStore {
         }
         let raw = tokio::fs::read_to_string(path).await?;
         Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    async fn resolve_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
+        let dir = self.base.join("identities");
+        if !tokio::fs::try_exists(&dir).await? {
+            return Ok(None);
+        }
+
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = tokio::fs::read_to_string(path).await?;
+            let doc: IdentityDocument = serde_json::from_str(&raw)?;
+            if doc.aliases.iter().any(|a| a == alias) {
+                return Ok(Some(doc));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -459,6 +488,33 @@ impl Store for SqliteStore {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
         }
+    }
+
+    async fn resolve_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>> {
+        let alias = alias.to_string();
+        let rows: Vec<String> = self
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT identity_json FROM identities")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.into());
+                rows
+            })
+            .await?;
+
+        for json in rows {
+            let doc: IdentityDocument = serde_json::from_str(&json)?;
+            if doc.aliases.iter().any(|a| a == &alias) {
+                return Ok(Some(doc));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -735,6 +791,26 @@ mod tests {
             .await
             .expect("fetch");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_resolve_alias_returns_matching_identity() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut doc = sample_identity_doc("amp:did:key:z6MkIdentityAlias");
+        doc.aliases = vec!["alice@mesh".to_string()];
+        store.store_identity(&doc).await.expect("store identity");
+
+        let resolved = store
+            .resolve_alias("alice@mesh")
+            .await
+            .expect("resolve alias");
+        assert!(resolved.is_some());
+        assert_eq!(
+            resolved.unwrap().identity_id.0,
+            "amp:did:key:z6MkIdentityAlias"
+        );
     }
 
     #[tokio::test]

@@ -64,6 +64,23 @@ pub async fn get_identity(
     }
 }
 
+pub async fn get_alias(State(state): State<Arc<AppState>>, Path(alias): Path<String>) -> Response {
+    match state.store.resolve_alias(&alias).await {
+        Ok(Some(doc)) => Json(doc).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(RelayErrorResponse {
+                error: RelayError {
+                    code: "not_found".to_string(),
+                    message: format!("alias {} not found", alias),
+                },
+            }),
+        )
+            .into_response(),
+        Err(_) => internal_error("storage_error", "failed to resolve alias"),
+    }
+}
+
 fn verify_doc_signature(doc: &IdentityDocument) -> Result<(), String> {
     if doc.signature.is_none() {
         return Err("identity document must be self-signed before publishing".to_string());
@@ -154,15 +171,20 @@ mod tests {
         Router::new()
             .route("/v1/identities/:identity_id", put(super::put_identity))
             .route("/v1/identities/:identity_id", get(super::get_identity))
+            .route("/v1/aliases/:alias", get(super::get_alias))
             .with_state(state)
     }
 
     fn make_signed_doc(identity_id: &str) -> IdentityDocument {
+        make_signed_doc_with_aliases(identity_id, vec![])
+    }
+
+    fn make_signed_doc_with_aliases(identity_id: &str, aliases: Vec<String>) -> IdentityDocument {
         let bundle = HybridPqKeyBundle::generate();
         let mut doc = IdentityDocument {
             version: 1,
             identity_id: IdentityId(identity_id.to_string()),
-            aliases: vec![],
+            aliases,
             signing_keys: vec![
                 PublicKeyRecord {
                     key_id: "sig-ed25519-1".to_string(),
@@ -253,6 +275,33 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_alias_returns_identity_document_when_alias_matches() {
+        let app = test_app().await;
+        let doc = make_signed_doc_with_aliases(
+            "amp:did:key:z6MkAliasTarget",
+            vec!["alice@mesh".to_string()],
+        );
+        let body = serde_json::to_string(&doc).unwrap();
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/v1/identities/amp:did:key:z6MkAliasTarget")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let put_resp = app.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(put_resp.status(), StatusCode::NO_CONTENT);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/v1/aliases/alice@mesh")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
