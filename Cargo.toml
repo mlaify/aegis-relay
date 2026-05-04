@@ -18,6 +18,8 @@ async-trait = "0.1"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

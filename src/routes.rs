@@ -13,25 +13,33 @@ use axum::{
 };
 
 use crate::storage::{LifecycleOutcome, StoreOutcome};
-use crate::{audit::AuditEvent, config::AuthMode, AppState};
+use crate::{audit::AuditEvent, config::AuthMode, AppState}; // AuthMode used in require_auth
 
 pub async fn healthz() -> &'static str {
     "ok"
 }
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Response {
+    let (auth_mode, require_push, require_identity) = {
+        let rt = state.runtime.read().unwrap();
+        (
+            match rt.auth_mode() {
+                AuthMode::Open => "open".to_string(),
+                AuthMode::Token => "token".to_string(),
+            },
+            rt.require_token_for_push,
+            rt.require_token_for_identity_put,
+        )
+    };
     match state.store.metrics().await {
         Ok(m) => Json(RelayStatusResponse {
             envelopes_total: m.envelopes_total,
             envelopes_acknowledged: m.envelopes_acknowledged,
             envelopes_active: m.envelopes_active,
             identities_total: m.identities_total,
-            auth_mode: match state.auth.mode {
-                AuthMode::Open => "open".to_string(),
-                AuthMode::Token => "token".to_string(),
-            },
-            require_token_for_push: state.auth.require_token_for_push,
-            require_token_for_identity_put: state.auth.require_token_for_identity_put,
+            auth_mode,
+            require_token_for_push: require_push,
+            require_token_for_identity_put: require_identity,
         })
         .into_response(),
         Err(_) => error_response(
@@ -343,7 +351,8 @@ pub async fn cleanup_store(State(state): State<Arc<AppState>>, headers: HeaderMa
     if let Err(err) = require_auth(&state, &headers, AuthScope::LifecycleChange) {
         return err.into_response();
     }
-    match state.store.cleanup(&state.retention).await {
+    let policy = state.runtime.read().unwrap().retention_policy();
+    match state.store.cleanup(&policy).await {
         Ok(report) => Json(RelayCleanupResponse {
             expired_removed: report.expired_removed,
             orphan_ack_removed: report.orphan_ack_removed,
@@ -370,14 +379,15 @@ pub fn require_auth(
     headers: &HeaderMap,
     scope: AuthScope,
 ) -> Result<(), LifecycleAuthError> {
-    if state.auth.mode == AuthMode::Open {
-        return Ok(());
-    }
+    let rt = state.runtime.read().unwrap();
 
-    if scope == AuthScope::PushEnvelope && !state.auth.require_token_for_push {
+    if rt.auth_mode() == AuthMode::Open {
         return Ok(());
     }
-    if scope == AuthScope::IdentityWrite && !state.auth.require_token_for_identity_put {
+    if scope == AuthScope::PushEnvelope && !rt.require_token_for_push {
+        return Ok(());
+    }
+    if scope == AuthScope::IdentityWrite && !rt.require_token_for_identity_put {
         return Ok(());
     }
 
@@ -387,7 +397,7 @@ pub fn require_auth(
     }
     let provided = provided.unwrap();
 
-    if state.auth.tokens.iter().any(|t| t == &provided) {
+    if rt.tokens.iter().any(|t| t == &provided) {
         Ok(())
     } else {
         Err(LifecycleAuthError::Forbidden)
@@ -461,7 +471,7 @@ mod tests {
     use crate::AppState;
     use crate::{
         audit::AuditSink,
-        config::{AuthMode, RelayAuthConfig, RetentionPolicy},
+        config::RuntimeConfig,
         storage::SqliteStore,
     };
 
@@ -487,21 +497,16 @@ mod tests {
         );
         let state = Arc::new(AppState {
             store: store.clone(),
-            auth: RelayAuthConfig {
-                mode: if token.is_some() {
-                    AuthMode::Token
-                } else {
-                    AuthMode::Open
-                },
+            runtime: Arc::new(std::sync::RwLock::new(RuntimeConfig {
                 tokens: token.map(|t| vec![t.to_string()]).unwrap_or_default(),
                 require_token_for_push,
                 require_token_for_identity_put: true,
-            },
-            retention: RetentionPolicy {
                 purge_acknowledged_on_cleanup: true,
                 max_message_age_days: None,
-            },
+            })),
+            admin_token: None,
             audit: AuditSink::new(None),
+            runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
         });
         let router = Router::new()
             .route("/healthz", get(super::healthz))
@@ -592,17 +597,16 @@ mod tests {
         let store = FileStore::new("/dev/null/aegis-relay-storage-fail");
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            auth: RelayAuthConfig {
-                mode: AuthMode::Open,
+            runtime: Arc::new(std::sync::RwLock::new(RuntimeConfig {
                 tokens: vec![],
                 require_token_for_push: false,
                 require_token_for_identity_put: true,
-            },
-            retention: RetentionPolicy {
                 purge_acknowledged_on_cleanup: true,
                 max_message_age_days: None,
-            },
+            })),
+            admin_token: None,
             audit: AuditSink::new(None),
+            runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
         });
         let app = Router::new()
             .route("/v1/envelopes", post(super::store_envelope))

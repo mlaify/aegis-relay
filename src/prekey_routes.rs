@@ -246,7 +246,7 @@ mod tests {
     use crate::AppState;
     use crate::{
         audit::AuditSink,
-        config::{AuthMode, RelayAuthConfig, RetentionPolicy},
+        config::RuntimeConfig,
         identity_routes,
         storage::SqliteStore,
     };
@@ -259,17 +259,16 @@ mod tests {
             .expect("sqlite in-memory");
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            auth: RelayAuthConfig {
-                mode: AuthMode::Open,
+            runtime: Arc::new(std::sync::RwLock::new(RuntimeConfig {
                 tokens: vec![],
                 require_token_for_push: false,
                 require_token_for_identity_put: false,
-            },
-            retention: RetentionPolicy {
                 purge_acknowledged_on_cleanup: true,
                 max_message_age_days: None,
-            },
+            })),
+            admin_token: None,
             audit: AuditSink::new(None),
+            runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
         });
         let app = Router::new()
             .route(
@@ -511,17 +510,16 @@ mod tests {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            auth: RelayAuthConfig {
-                mode: AuthMode::Open,
+            runtime: Arc::new(std::sync::RwLock::new(RuntimeConfig {
                 tokens: vec![],
                 require_token_for_push: false,
                 require_token_for_identity_put: false,
-            },
-            retention: RetentionPolicy {
                 purge_acknowledged_on_cleanup: true,
                 max_message_age_days: None,
-            },
+            })),
+            admin_token: None,
             audit: AuditSink::new(None),
+            runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
         });
         let app: Router = Router::new()
             .route(

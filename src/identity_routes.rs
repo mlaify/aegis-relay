@@ -199,7 +199,7 @@ mod tests {
     use crate::AppState;
     use crate::{
         audit::AuditSink,
-        config::{AuthMode, RelayAuthConfig, RetentionPolicy},
+        config::RuntimeConfig,
         storage::SqliteStore,
     };
 
@@ -213,21 +213,16 @@ mod tests {
             .expect("sqlite in-memory");
         let state = Arc::new(AppState {
             store: Arc::new(store),
-            auth: RelayAuthConfig {
-                mode: if token.is_some() {
-                    AuthMode::Token
-                } else {
-                    AuthMode::Open
-                },
+            runtime: Arc::new(std::sync::RwLock::new(RuntimeConfig {
                 tokens: token.map(|t| vec![t.to_string()]).unwrap_or_default(),
                 require_token_for_push: false,
                 require_token_for_identity_put: true,
-            },
-            retention: RetentionPolicy {
                 purge_acknowledged_on_cleanup: true,
                 max_message_age_days: None,
-            },
+            })),
+            admin_token: None,
             audit: AuditSink::new(None),
+            runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
         });
         Router::new()
             .route("/v1/identities/:identity_id", put(super::put_identity))
