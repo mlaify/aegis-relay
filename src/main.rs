@@ -9,11 +9,13 @@ mod storage;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
+    http::{HeaderName, Method},
     routing::{delete, get, post, put},
     Router,
 };
 use config::{RelayConfig, RuntimeConfig};
 use storage::{SqliteStore, Store};
+use tower_http::cors::{Any, CorsLayer};
 
 pub struct AppState {
     pub store: Arc<dyn Store>,
@@ -94,7 +96,17 @@ async fn main() {
         .route("/admin/cleanup", post(admin_routes::admin_cleanup))
         .route("/admin/identities", get(admin_routes::admin_list_identities))
         .route("/admin/audit", get(admin_routes::admin_audit_log))
-        .with_state(state);
+        .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+                .allow_headers([
+                    HeaderName::from_static("authorization"),
+                    HeaderName::from_static("content-type"),
+                    HeaderName::from_static("x-aegis-admin-token"),
+                ]),
+        );
 
     let addr: SocketAddr = bind.parse().expect("invalid AEGIS_RELAY_BIND address");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
