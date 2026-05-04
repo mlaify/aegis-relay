@@ -478,3 +478,451 @@ pub async fn admin_audit_log(
             .into_response(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Domain management
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct DomainListItem {
+    pub domain: String,
+    pub verification_token: String,
+    pub verified: bool,
+    pub verified_at: Option<String>,
+    pub added_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DomainListResponse {
+    pub items: Vec<DomainListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimDomainRequest {
+    pub domain: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimDomainResponse {
+    pub domain: String,
+    pub verification_record: String,
+    pub verification_token: String,
+    pub verified: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyDomainResponse {
+    pub domain: String,
+    pub verified: bool,
+    pub detail: Option<String>,
+}
+
+fn domain_entry_to_item(e: crate::storage::DomainEntry) -> DomainListItem {
+    DomainListItem {
+        verified: e.verified_at.is_some(),
+        domain: e.domain,
+        verification_token: e.verification_token,
+        verified_at: e.verified_at,
+        added_at: e.added_at,
+    }
+}
+
+fn normalize_domain(input: &str) -> Option<String> {
+    let d = input.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() || d.contains('/') || d.contains(' ') || !d.contains('.') {
+        return None;
+    }
+    Some(d)
+}
+
+pub async fn admin_list_domains(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    match state.store.list_served_domains().await {
+        Ok(entries) => Json(DomainListResponse {
+            items: entries.into_iter().map(domain_entry_to_item).collect(),
+        })
+        .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "list domains failed" } })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn admin_claim_domain(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<ClaimDomainRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let Json(body) = match payload {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": { "code": "invalid_request", "message": e.body_text() } })),
+            )
+                .into_response()
+        }
+    };
+    let domain = match normalize_domain(&body.domain) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": { "code": "invalid_domain", "message": "domain must be a non-empty hostname with at least one dot" } })),
+            )
+                .into_response()
+        }
+    };
+    let token = format!("aegis-verify-{}", uuid::Uuid::new_v4().simple());
+    match state.store.add_served_domain(&domain, &token).await {
+        Ok(entry) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "admin_claim_domain",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: None,
+                    identity_id: None,
+                    detail: Some(&format!("domain={}", entry.domain)),
+                })
+                .await;
+            let verified = entry.verified_at.is_some();
+            Json(ClaimDomainResponse {
+                verification_record: format!(
+                    "_aegis-verify.{}. IN TXT \"{}\"",
+                    entry.domain, entry.verification_token
+                ),
+                domain: entry.domain,
+                verification_token: entry.verification_token,
+                verified,
+            })
+            .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "claim failed" } })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn admin_verify_domain(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(domain): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let domain = match normalize_domain(&domain) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": { "code": "invalid_domain", "message": "invalid domain" } })),
+            )
+                .into_response()
+        }
+    };
+    let entry = match state.store.get_served_domain(&domain).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": { "code": "not_found", "message": "domain not claimed" } })),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": { "code": "storage_error", "message": "lookup failed" } })),
+            )
+                .into_response()
+        }
+    };
+
+    let verify_target = format!("_aegis-verify.{}", domain);
+    let lookup = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+        use hickory_resolver::config::*;
+        use hickory_resolver::Resolver;
+        let resolver =
+            Resolver::new(ResolverConfig::default(), ResolverOpts::default()).map_err(|e| e.to_string())?;
+        let txts = resolver.txt_lookup(verify_target).map_err(|e| e.to_string())?;
+        Ok(txts
+            .into_iter()
+            .flat_map(|r| r.txt_data().iter().map(|d| String::from_utf8_lossy(d).to_string()).collect::<Vec<_>>())
+            .collect())
+    })
+    .await;
+
+    let detail;
+    let verified = match lookup {
+        Ok(Ok(values)) => {
+            let found = values.iter().any(|v| v == &entry.verification_token);
+            if !found {
+                detail = Some(format!(
+                    "expected TXT \"{}\" at _aegis-verify.{} (found {} record(s))",
+                    entry.verification_token, domain, values.len()
+                ));
+            } else {
+                detail = None;
+            }
+            found
+        }
+        Ok(Err(e)) => {
+            detail = Some(format!("DNS lookup failed: {e}"));
+            false
+        }
+        Err(_) => {
+            detail = Some("verification task panicked".to_string());
+            false
+        }
+    };
+
+    if verified {
+        let _ = state.store.mark_domain_verified(&domain).await;
+    }
+
+    state
+        .audit
+        .record(AuditEvent {
+            at: chrono::Utc::now(),
+            operation: "admin_verify_domain",
+            outcome: if verified { "ok" } else { "failed" },
+            recipient_id: None,
+            envelope_id: None,
+            identity_id: None,
+            detail: Some(&format!("domain={}", domain)),
+        })
+        .await;
+
+    Json(VerifyDomainResponse { domain, verified, detail }).into_response()
+}
+
+pub async fn admin_release_domain(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(domain): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let domain = match normalize_domain(&domain) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": { "code": "invalid_domain", "message": "invalid domain" } })),
+            )
+                .into_response()
+        }
+    };
+    match state.store.release_served_domain(&domain).await {
+        Ok(removed) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "admin_release_domain",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: None,
+                    identity_id: None,
+                    detail: Some(&format!("domain={} aliases_removed={}", domain, removed)),
+                })
+                .await;
+            Json(serde_json::json!({ "domain": domain, "aliases_removed": removed })).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "release failed" } })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User provisioning
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UserListParams {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserListItem {
+    pub alias: String,
+    pub identity_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserListResponse {
+    pub offset: usize,
+    pub limit: usize,
+    pub items: Vec<UserListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProvisionUserRequest {
+    pub alias: String,
+}
+
+pub async fn admin_list_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<UserListParams>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let limit = params.limit.min(200);
+    match state
+        .store
+        .list_provisioned_users(params.domain.as_deref(), params.offset, limit)
+        .await
+    {
+        Ok(entries) => Json(UserListResponse {
+            offset: params.offset,
+            limit,
+            items: entries
+                .into_iter()
+                .map(|e| UserListItem {
+                    alias: e.alias,
+                    identity_id: e.identity_id,
+                    status: e.status,
+                    created_at: e.created_at,
+                    updated_at: e.updated_at,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "list users failed" } })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn admin_provision_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<ProvisionUserRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let Json(body) = match payload {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": { "code": "invalid_request", "message": e.body_text() } })),
+            )
+                .into_response()
+        }
+    };
+    let alias = body.alias.trim().to_ascii_lowercase();
+    if !alias.contains('@') || alias.starts_with('@') || alias.ends_with('@') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": { "code": "invalid_alias", "message": "alias must be in user@domain form" } })),
+        )
+            .into_response();
+    }
+    match state.store.provision_user(&alias).await {
+        Ok(crate::storage::ProvisionOutcome::Created) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "admin_provision_user",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: None,
+                    identity_id: None,
+                    detail: Some(&format!("alias={}", alias)),
+                })
+                .await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "alias": alias, "status": "provisioned" })),
+            )
+                .into_response()
+        }
+        Ok(crate::storage::ProvisionOutcome::AlreadyExists) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": { "code": "already_exists", "message": "alias is already provisioned" } })),
+        )
+            .into_response(),
+        Ok(crate::storage::ProvisionOutcome::DomainNotServed) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": { "code": "domain_not_served", "message": "alias domain is not served by this relay" } })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "provision failed" } })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn admin_deprovision_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(alias): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let alias = alias.trim().to_ascii_lowercase();
+    match state.store.deprovision_user(&alias).await {
+        Ok(true) => {
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "admin_deprovision_user",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: None,
+                    identity_id: None,
+                    detail: Some(&format!("alias={}", alias)),
+                })
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": { "code": "not_found", "message": "alias not provisioned" } })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "deprovision failed" } })),
+        )
+            .into_response(),
+    }
+}
