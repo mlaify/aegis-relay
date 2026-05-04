@@ -65,6 +65,10 @@ pub struct RelayConfig {
     pub admin_token: Option<String>,
     pub runtime_config_path: PathBuf,
     pub audit_log_path: Option<PathBuf>,
+    /// Externally reachable base URL of this relay (e.g. `https://relay.company.com`).
+    /// Advertised in `/.well-known/aegis-config` so clients can discover where
+    /// to reach the relay independent of bind address.
+    pub public_url: Option<String>,
     /// Initial runtime config (env-var defaults, optionally overlaid from file).
     pub runtime: RuntimeConfig,
 }
@@ -125,12 +129,18 @@ impl RelayConfig {
             runtime = overlay;
         }
 
+        let public_url = std::env::var("AEGIS_RELAY_PUBLIC_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+
         Self {
             bind,
             db_path,
             admin_token,
             runtime_config_path,
             audit_log_path,
+            public_url,
             runtime,
         }
     }

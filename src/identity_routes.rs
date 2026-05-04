@@ -287,6 +287,7 @@ mod tests {
             admin_token: None,
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
+            public_url: None,
         });
         Router::new()
             .route("/v1/identities/:identity_id", put(super::put_identity))

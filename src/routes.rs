@@ -507,6 +507,7 @@ mod tests {
             admin_token: None,
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
+            public_url: None,
         });
         let router = Router::new()
             .route("/healthz", get(super::healthz))
@@ -607,6 +608,7 @@ mod tests {
             admin_token: None,
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
+            public_url: None,
         });
         let app = Router::new()
             .route("/v1/envelopes", post(super::store_envelope))

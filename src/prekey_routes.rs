@@ -269,6 +269,7 @@ mod tests {
             admin_token: None,
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
+            public_url: None,
         });
         let app = Router::new()
             .route(
@@ -520,6 +521,7 @@ mod tests {
             admin_token: None,
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
+            public_url: None,
         });
         let app: Router = Router::new()
             .route(
