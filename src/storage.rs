@@ -14,6 +14,18 @@ pub enum LifecycleOutcome {
     NotFound,
 }
 
+/// Outcome of `store_with_prekey_consumption`.
+///
+/// `Stored` indicates the envelope was persisted and any prekey ids in
+/// `used_prekey_ids` were recorded as consumed atomically. `PrekeyAlreadyUsed`
+/// indicates one of the supplied `key_id` values is already on record for the
+/// recipient — the envelope was NOT stored and no new consumption was recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOutcome {
+    Stored,
+    PrekeyAlreadyUsed { key_id: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupReport {
     pub expired_removed: usize,
@@ -39,6 +51,19 @@ pub trait Store: Send + Sync {
         &self,
         envelope: &Envelope,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Store an envelope and atomically record each `key_id` in
+    /// `envelope.used_prekey_ids` as consumed for `envelope.recipient_id`.
+    ///
+    /// If any `key_id` is already on record as consumed for the recipient,
+    /// returns `Ok(StoreOutcome::PrekeyAlreadyUsed { key_id })` and persists
+    /// neither the envelope nor any partial consumption record.
+    ///
+    /// When `used_prekey_ids` is empty this is equivalent to `store` and
+    /// returns `Ok(StoreOutcome::Stored)`.
+    async fn store_with_prekey_consumption(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<StoreOutcome, Box<dyn std::error::Error + Send + Sync>>;
     async fn fetch(
         &self,
         recipient_id: &str,
@@ -114,6 +139,16 @@ impl Store for FileStore {
         let data = serde_json::to_vec_pretty(envelope)?;
         tokio::fs::write(file, data).await?;
         Ok(())
+    }
+
+    async fn store_with_prekey_consumption(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<StoreOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        // FileStore is a dev/testing fallback and does not implement prekey
+        // consumption tracking. Production deployments use SqliteStore.
+        self.store(envelope).await?;
+        Ok(StoreOutcome::Stored)
     }
 
     async fn fetch(
@@ -374,6 +409,13 @@ const MIGRATIONS: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_identity_aliases_identity_id
         ON identity_aliases(identity_id);
+    CREATE TABLE IF NOT EXISTS consumed_prekeys (
+        recipient_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        consumed_at TEXT NOT NULL,
+        envelope_id TEXT NOT NULL,
+        PRIMARY KEY (recipient_id, key_id)
+    );
 ";
 
 pub struct SqliteStore {
@@ -423,6 +465,55 @@ impl Store for SqliteStore {
             })
             .await?;
         Ok(())
+    }
+
+    async fn store_with_prekey_consumption(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<StoreOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(envelope)?;
+        let envelope_id = envelope.envelope_id.0.to_string();
+        let recipient_id = envelope.recipient_id.0.clone();
+        let expires_at = envelope
+            .expires_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+        let used_prekey_ids = envelope.used_prekey_ids.clone();
+        let consumed_at = Utc::now().to_rfc3339();
+        let outcome = self
+            .conn
+            .call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                for key_id in &used_prekey_ids {
+                    let res = tx.execute(
+                        "INSERT INTO consumed_prekeys \
+                         (recipient_id, key_id, consumed_at, envelope_id) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![recipient_id, key_id, consumed_at, envelope_id],
+                    );
+                    match res {
+                        Ok(_) => {}
+                        Err(rusqlite::Error::SqliteFailure(err, _))
+                            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                        {
+                            // Drop tx without commit -> rollback.
+                            return Ok(StoreOutcome::PrekeyAlreadyUsed {
+                                key_id: key_id.clone(),
+                            });
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO envelopes \
+                     (envelope_id, recipient_id, envelope_json, expires_at, acknowledged) \
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    rusqlite::params![envelope_id, recipient_id, json, expires_at],
+                )?;
+                tx.commit()?;
+                Ok(StoreOutcome::Stored)
+            })
+            .await?;
+        Ok(outcome)
     }
 
     async fn fetch(
@@ -679,7 +770,7 @@ fn is_expired(envelope: &Envelope) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileStore, LifecycleOutcome, SqliteStore, Store};
+    use super::{FileStore, LifecycleOutcome, SqliteStore, Store, StoreOutcome};
     use crate::config::RetentionPolicy;
     use aegis_proto::{
         EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
@@ -1035,5 +1126,169 @@ mod tests {
             fetched.is_empty(),
             "expired envelope should not be returned"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prekey consumption tests (RFC-0003 §12)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prekey_consumption_empty_list_is_no_op() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let envelope = sample_envelope("amp:did:key:z6MkPkEmpty");
+        assert!(envelope.used_prekey_ids.is_empty());
+
+        let outcome = store
+            .store_with_prekey_consumption(&envelope)
+            .await
+            .expect("store");
+        assert_eq!(outcome, StoreOutcome::Stored);
+
+        let fetched = store.fetch("amp:did:key:z6MkPkEmpty").await.expect("fetch");
+        assert_eq!(fetched.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prekey_consumption_first_use_succeeds() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut envelope = sample_envelope("amp:did:key:z6MkPkFirst");
+        envelope.used_prekey_ids = vec!["pk-1".to_string()];
+
+        let outcome = store
+            .store_with_prekey_consumption(&envelope)
+            .await
+            .expect("store");
+        assert_eq!(outcome, StoreOutcome::Stored);
+    }
+
+    #[tokio::test]
+    async fn prekey_consumption_replay_rejected() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let recipient = "amp:did:key:z6MkPkReplay";
+
+        let mut first = sample_envelope(recipient);
+        first.used_prekey_ids = vec!["pk-replay".to_string()];
+        let outcome1 = store
+            .store_with_prekey_consumption(&first)
+            .await
+            .expect("first store");
+        assert_eq!(outcome1, StoreOutcome::Stored);
+
+        let mut second = sample_envelope(recipient);
+        second.used_prekey_ids = vec!["pk-replay".to_string()];
+        let outcome2 = store
+            .store_with_prekey_consumption(&second)
+            .await
+            .expect("second store");
+        assert_eq!(
+            outcome2,
+            StoreOutcome::PrekeyAlreadyUsed {
+                key_id: "pk-replay".to_string()
+            }
+        );
+
+        // Only the first envelope should be persisted.
+        let fetched = store.fetch(recipient).await.expect("fetch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].envelope_id.0, first.envelope_id.0);
+    }
+
+    #[tokio::test]
+    async fn prekey_consumption_all_or_nothing_rollback() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let recipient = "amp:did:key:z6MkPkRollback";
+
+        // Pre-consume one key.
+        let mut prior = sample_envelope(recipient);
+        prior.used_prekey_ids = vec!["pk-already".to_string()];
+        store
+            .store_with_prekey_consumption(&prior)
+            .await
+            .expect("prior");
+
+        // Attempt second envelope claiming a fresh key + the already-consumed one.
+        let mut second = sample_envelope(recipient);
+        second.used_prekey_ids = vec!["pk-fresh".to_string(), "pk-already".to_string()];
+        let outcome = store
+            .store_with_prekey_consumption(&second)
+            .await
+            .expect("second");
+        assert_eq!(
+            outcome,
+            StoreOutcome::PrekeyAlreadyUsed {
+                key_id: "pk-already".to_string()
+            }
+        );
+
+        // Second envelope must NOT be persisted.
+        let fetched = store.fetch(recipient).await.expect("fetch");
+        assert_eq!(
+            fetched.len(),
+            1,
+            "rollback should leave only the first envelope"
+        );
+        assert_eq!(fetched[0].envelope_id.0, prior.envelope_id.0);
+
+        // Critically: the fresh key MUST NOT be marked consumed (rollback).
+        // Verify by attempting to use it on a new envelope; should succeed.
+        let mut third = sample_envelope(recipient);
+        third.used_prekey_ids = vec!["pk-fresh".to_string()];
+        let outcome3 = store
+            .store_with_prekey_consumption(&third)
+            .await
+            .expect("third");
+        assert_eq!(
+            outcome3,
+            StoreOutcome::Stored,
+            "pk-fresh should not have been consumed by the rolled-back transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn prekey_consumption_isolated_per_recipient() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+
+        // Same key_id, different recipients — both must be allowed.
+        let mut a = sample_envelope("amp:did:key:z6MkRcptA");
+        a.used_prekey_ids = vec!["pk-shared".to_string()];
+        assert_eq!(
+            store.store_with_prekey_consumption(&a).await.expect("a"),
+            StoreOutcome::Stored
+        );
+
+        let mut b = sample_envelope("amp:did:key:z6MkRcptB");
+        b.used_prekey_ids = vec!["pk-shared".to_string()];
+        assert_eq!(
+            store.store_with_prekey_consumption(&b).await.expect("b"),
+            StoreOutcome::Stored
+        );
+    }
+
+    #[tokio::test]
+    async fn prekey_consumption_filestore_no_op_returns_stored() {
+        let base = std::env::temp_dir().join(format!("aegis-relay-pk-fs-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let store = FileStore::new(&base);
+
+        let mut envelope = sample_envelope("amp:did:key:z6MkFsPk");
+        envelope.used_prekey_ids = vec!["pk-irrelevant".to_string()];
+        let outcome = store
+            .store_with_prekey_consumption(&envelope)
+            .await
+            .expect("store");
+        // FileStore is dev-only and does not enforce; documented behavior.
+        assert_eq!(outcome, StoreOutcome::Stored);
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }
