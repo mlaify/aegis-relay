@@ -993,7 +993,10 @@ mod tests {
 
         // Old alias must not resolve any more
         let old = store.resolve_alias("old@mesh").await.expect("resolve old");
-        assert!(old.is_none(), "stale alias must not resolve after re-publish");
+        assert!(
+            old.is_none(),
+            "stale alias must not resolve after re-publish"
+        );
 
         // New alias must resolve
         let new = store.resolve_alias("new@mesh").await.expect("resolve new");
