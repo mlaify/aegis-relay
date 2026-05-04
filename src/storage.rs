@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::RetentionPolicy;
-use aegis_proto::{Envelope, IdentityDocument};
+use aegis_proto::{Envelope, IdentityDocument, PrekeyBundle};
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::OptionalExtension;
@@ -17,13 +17,37 @@ pub enum LifecycleOutcome {
 /// Outcome of `store_with_prekey_consumption`.
 ///
 /// `Stored` indicates the envelope was persisted and any prekey ids in
-/// `used_prekey_ids` were recorded as consumed atomically. `PrekeyAlreadyUsed`
-/// indicates one of the supplied `key_id` values is already on record for the
-/// recipient — the envelope was NOT stored and no new consumption was recorded.
+/// `used_prekey_ids` were recorded as consumed atomically.
+///
+/// `PrekeyAlreadyUsed` indicates one of the supplied `key_id` values is
+/// already on record for the recipient — the envelope was NOT stored and
+/// no new consumption was recorded.
+///
+/// `UnknownPrekey` indicates a `key_id` in `used_prekey_ids` does not match
+/// any prekey published by the recipient — the envelope was NOT stored.
+/// (v0.3 phase 2: senders MUST claim a prekey before referencing it.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreOutcome {
     Stored,
     PrekeyAlreadyUsed { key_id: String },
+    UnknownPrekey { key_id: String },
+}
+
+/// One unclaimed one-time prekey, returned by `claim_one_time_prekey`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedPrekey {
+    pub identity_id: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key_b64: String,
+}
+
+/// Result of publishing a `PrekeyBundle` — counts new vs. duplicate
+/// `(identity_id, key_id)` rows, so the caller can report idempotency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PublishPrekeyReport {
+    pub inserted: usize,
+    pub skipped: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +119,21 @@ pub trait Store: Send + Sync {
         alias: &str,
     ) -> Result<Option<IdentityDocument>, Box<dyn std::error::Error + Send + Sync>>;
     async fn metrics(&self) -> Result<RelayMetrics, Box<dyn std::error::Error + Send + Sync>>;
+    /// Publish all one-time prekeys from `bundle` into the unclaimed pool.
+    ///
+    /// Idempotent: existing `(identity_id, key_id)` rows are kept as-is
+    /// (so re-publishing a partially-consumed bundle does not reset the
+    /// `claimed` flag on already-consumed entries).
+    async fn store_one_time_prekeys(
+        &self,
+        bundle: &PrekeyBundle,
+    ) -> Result<PublishPrekeyReport, Box<dyn std::error::Error + Send + Sync>>;
+    /// Atomically claim one unclaimed one-time prekey for `identity_id` and
+    /// mark it consumed. Returns `None` if the unclaimed pool is empty.
+    async fn claim_one_time_prekey(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<ClaimedPrekey>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +188,25 @@ impl Store for FileStore {
         // consumption tracking. Production deployments use SqliteStore.
         self.store(envelope).await?;
         Ok(StoreOutcome::Stored)
+    }
+
+    async fn store_one_time_prekeys(
+        &self,
+        bundle: &PrekeyBundle,
+    ) -> Result<PublishPrekeyReport, Box<dyn std::error::Error + Send + Sync>> {
+        // FileStore is dev-only; do not persist prekeys. The relay's prekey
+        // routes assume the production SqliteStore.
+        Ok(PublishPrekeyReport {
+            inserted: bundle.one_time_prekeys.len(),
+            skipped: 0,
+        })
+    }
+
+    async fn claim_one_time_prekey(
+        &self,
+        _identity_id: &str,
+    ) -> Result<Option<ClaimedPrekey>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
     }
 
     async fn fetch(
@@ -416,6 +474,19 @@ const MIGRATIONS: &str = "
         envelope_id TEXT NOT NULL,
         PRIMARY KEY (recipient_id, key_id)
     );
+    CREATE TABLE IF NOT EXISTS one_time_prekeys (
+        identity_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        algorithm TEXT NOT NULL,
+        public_key_b64 TEXT NOT NULL,
+        bundle_signature TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        claimed INTEGER NOT NULL DEFAULT 0,
+        claimed_at TEXT,
+        PRIMARY KEY (identity_id, key_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_one_time_prekeys_unclaimed
+        ON one_time_prekeys(identity_id, claimed);
 ";
 
 pub struct SqliteStore {
@@ -484,6 +555,23 @@ impl Store for SqliteStore {
             .call(move |c| {
                 let tx = c.unchecked_transaction()?;
                 for key_id in &used_prekey_ids {
+                    // (v0.3 phase 2) Verify the prekey was actually published
+                    // for this recipient. Same transaction so a concurrent
+                    // publish/claim cannot race us.
+                    let exists: Option<i64> = tx
+                        .query_row(
+                            "SELECT 1 FROM one_time_prekeys \
+                             WHERE identity_id = ?1 AND key_id = ?2",
+                            rusqlite::params![recipient_id, key_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if exists.is_none() {
+                        return Ok(StoreOutcome::UnknownPrekey {
+                            key_id: key_id.clone(),
+                        });
+                    }
+
                     let res = tx.execute(
                         "INSERT INTO consumed_prekeys \
                          (recipient_id, key_id, consumed_at, envelope_id) \
@@ -743,6 +831,118 @@ impl Store for SqliteStore {
             envelopes_active: envelopes_active as usize,
             identities_total: identities_total as usize,
         })
+    }
+
+    async fn store_one_time_prekeys(
+        &self,
+        bundle: &PrekeyBundle,
+    ) -> Result<PublishPrekeyReport, Box<dyn std::error::Error + Send + Sync>> {
+        let identity_id = bundle.identity_id.0.clone();
+        let signature = bundle.signature.clone().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> { "prekey bundle is unsigned".into() },
+        )?;
+        let entries: Vec<(String, String, String)> = bundle
+            .one_time_prekeys
+            .iter()
+            .map(|k| {
+                (
+                    k.key_id.clone(),
+                    k.algorithm.clone(),
+                    k.public_key_b64.clone(),
+                )
+            })
+            .collect();
+        let published_at = Utc::now().to_rfc3339();
+        let report = self
+            .conn
+            .call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                let mut inserted = 0usize;
+                let mut skipped = 0usize;
+                for (key_id, algorithm, public_key_b64) in &entries {
+                    // INSERT OR IGNORE: re-publishing a partially-consumed
+                    // bundle is idempotent and does NOT reset claimed=1 on
+                    // already-consumed entries.
+                    let rows = tx.execute(
+                        "INSERT OR IGNORE INTO one_time_prekeys \
+                         (identity_id, key_id, algorithm, public_key_b64, \
+                          bundle_signature, published_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            identity_id,
+                            key_id,
+                            algorithm,
+                            public_key_b64,
+                            signature,
+                            published_at
+                        ],
+                    )?;
+                    if rows == 1 {
+                        inserted += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                tx.commit()?;
+                Ok(PublishPrekeyReport { inserted, skipped })
+            })
+            .await?;
+        Ok(report)
+    }
+
+    async fn claim_one_time_prekey(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<ClaimedPrekey>, Box<dyn std::error::Error + Send + Sync>> {
+        let identity_id = identity_id.to_string();
+        let claimed_at = Utc::now().to_rfc3339();
+        let claimed = self
+            .conn
+            .call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                // Pick one unclaimed prekey for this identity.
+                let pick: Option<(String, String, String)> = tx
+                    .query_row(
+                        "SELECT key_id, algorithm, public_key_b64 \
+                         FROM one_time_prekeys \
+                         WHERE identity_id = ?1 AND claimed = 0 \
+                         ORDER BY published_at ASC, key_id ASC \
+                         LIMIT 1",
+                        rusqlite::params![identity_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((key_id, algorithm, public_key_b64)) = pick else {
+                    tx.commit()?;
+                    return Ok(None);
+                };
+                // Mark it claimed under the same transaction.
+                let updated = tx.execute(
+                    "UPDATE one_time_prekeys \
+                     SET claimed = 1, claimed_at = ?3 \
+                     WHERE identity_id = ?1 AND key_id = ?2 AND claimed = 0",
+                    rusqlite::params![identity_id, key_id, claimed_at],
+                )?;
+                if updated != 1 {
+                    // Lost a race; bail without committing.
+                    return Ok(None);
+                }
+                tx.commit()?;
+                Ok(Some(ClaimedPrekey {
+                    identity_id: identity_id.clone(),
+                    key_id,
+                    algorithm,
+                    public_key_b64,
+                }))
+            })
+            .await?;
+        Ok(claimed)
     }
 }
 
@@ -1132,6 +1332,29 @@ mod tests {
     // Prekey consumption tests (RFC-0003 §12)
     // -----------------------------------------------------------------------
 
+    /// Publish a one-time prekey for `recipient` so that subsequent
+    /// `store_with_prekey_consumption` calls referencing `key_id` pass the
+    /// published-check. Used by phase-1 enforcement tests.
+    async fn publish_test_prekey(store: &SqliteStore, recipient: &str, key_id: &str) {
+        use aegis_proto::{IdentityId, PrekeyBundle, PublicKeyRecord};
+        let bundle = PrekeyBundle {
+            identity_id: IdentityId(recipient.to_string()),
+            signed_prekeys: vec![],
+            one_time_prekeys: vec![PublicKeyRecord {
+                key_id: key_id.to_string(),
+                algorithm: "AMP-MLKEM768-V1".to_string(),
+                public_key_b64: "AAAA".to_string(),
+            }],
+            supported_suites: vec![],
+            expires_at: None,
+            signature: Some("test-signature".to_string()),
+        };
+        store
+            .store_one_time_prekeys(&bundle)
+            .await
+            .expect("publish test prekey");
+    }
+
     #[tokio::test]
     async fn prekey_consumption_empty_list_is_no_op() {
         let store = SqliteStore::open_in_memory()
@@ -1155,7 +1378,10 @@ mod tests {
         let store = SqliteStore::open_in_memory()
             .await
             .expect("in-memory sqlite");
-        let mut envelope = sample_envelope("amp:did:key:z6MkPkFirst");
+        let recipient = "amp:did:key:z6MkPkFirst";
+        publish_test_prekey(&store, recipient, "pk-1").await;
+
+        let mut envelope = sample_envelope(recipient);
         envelope.used_prekey_ids = vec!["pk-1".to_string()];
 
         let outcome = store
@@ -1166,11 +1392,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prekey_consumption_unknown_prekey_rejected() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let mut envelope = sample_envelope("amp:did:key:z6MkPkUnknown");
+        envelope.used_prekey_ids = vec!["pk-never-published".to_string()];
+
+        let outcome = store
+            .store_with_prekey_consumption(&envelope)
+            .await
+            .expect("store");
+        assert_eq!(
+            outcome,
+            StoreOutcome::UnknownPrekey {
+                key_id: "pk-never-published".to_string()
+            }
+        );
+
+        let fetched = store
+            .fetch("amp:did:key:z6MkPkUnknown")
+            .await
+            .expect("fetch");
+        assert!(fetched.is_empty(), "envelope must not be persisted");
+    }
+
+    #[tokio::test]
     async fn prekey_consumption_replay_rejected() {
         let store = SqliteStore::open_in_memory()
             .await
             .expect("in-memory sqlite");
         let recipient = "amp:did:key:z6MkPkReplay";
+        publish_test_prekey(&store, recipient, "pk-replay").await;
 
         let mut first = sample_envelope(recipient);
         first.used_prekey_ids = vec!["pk-replay".to_string()];
@@ -1205,6 +1458,8 @@ mod tests {
             .await
             .expect("in-memory sqlite");
         let recipient = "amp:did:key:z6MkPkRollback";
+        publish_test_prekey(&store, recipient, "pk-already").await;
+        publish_test_prekey(&store, recipient, "pk-fresh").await;
 
         // Pre-consume one key.
         let mut prior = sample_envelope(recipient);
@@ -1257,6 +1512,8 @@ mod tests {
         let store = SqliteStore::open_in_memory()
             .await
             .expect("in-memory sqlite");
+        publish_test_prekey(&store, "amp:did:key:z6MkRcptA", "pk-shared").await;
+        publish_test_prekey(&store, "amp:did:key:z6MkRcptB", "pk-shared").await;
 
         // Same key_id, different recipients — both must be allowed.
         let mut a = sample_envelope("amp:did:key:z6MkRcptA");
@@ -1272,6 +1529,161 @@ mod tests {
             store.store_with_prekey_consumption(&b).await.expect("b"),
             StoreOutcome::Stored
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prekey publish / claim tests (RFC-0004 §5/§12, v0.3 phase 2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_one_time_prekeys_inserts_and_skips_duplicates() {
+        use aegis_proto::{IdentityId, PrekeyBundle, PublicKeyRecord};
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let id = "amp:did:key:z6MkPubPk";
+
+        let bundle = PrekeyBundle {
+            identity_id: IdentityId(id.to_string()),
+            signed_prekeys: vec![],
+            one_time_prekeys: vec![
+                PublicKeyRecord {
+                    key_id: "ot-1".to_string(),
+                    algorithm: "AMP-MLKEM768-V1".to_string(),
+                    public_key_b64: "AAAA".to_string(),
+                },
+                PublicKeyRecord {
+                    key_id: "ot-2".to_string(),
+                    algorithm: "AMP-MLKEM768-V1".to_string(),
+                    public_key_b64: "BBBB".to_string(),
+                },
+            ],
+            supported_suites: vec![],
+            expires_at: None,
+            signature: Some("sig".to_string()),
+        };
+        let report = store
+            .store_one_time_prekeys(&bundle)
+            .await
+            .expect("publish");
+        assert_eq!(report.inserted, 2);
+        assert_eq!(report.skipped, 0);
+
+        // Republish the same bundle — both rows should be skipped (idempotent).
+        let report2 = store
+            .store_one_time_prekeys(&bundle)
+            .await
+            .expect("republish");
+        assert_eq!(report2.inserted, 0);
+        assert_eq!(report2.skipped, 2);
+    }
+
+    #[tokio::test]
+    async fn claim_one_time_prekey_returns_one_then_pool_empties() {
+        use aegis_proto::{IdentityId, PrekeyBundle, PublicKeyRecord};
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let id = "amp:did:key:z6MkClaimPk";
+
+        let bundle = PrekeyBundle {
+            identity_id: IdentityId(id.to_string()),
+            signed_prekeys: vec![],
+            one_time_prekeys: vec![PublicKeyRecord {
+                key_id: "ot-only".to_string(),
+                algorithm: "AMP-MLKEM768-V1".to_string(),
+                public_key_b64: "Z29uZQ==".to_string(),
+            }],
+            supported_suites: vec![],
+            expires_at: None,
+            signature: Some("sig".to_string()),
+        };
+        store
+            .store_one_time_prekeys(&bundle)
+            .await
+            .expect("publish");
+
+        let first = store
+            .claim_one_time_prekey(id)
+            .await
+            .expect("claim 1")
+            .expect("should return one prekey");
+        assert_eq!(first.key_id, "ot-only");
+        assert_eq!(first.algorithm, "AMP-MLKEM768-V1");
+        assert_eq!(first.public_key_b64, "Z29uZQ==");
+
+        // Pool is now empty.
+        let second = store.claim_one_time_prekey(id).await.expect("claim 2");
+        assert!(second.is_none(), "pool should be empty after one claim");
+    }
+
+    #[tokio::test]
+    async fn claim_one_time_prekey_concurrent_serialization() {
+        // Two parallel claims on the same identity should each return a
+        // distinct prekey when the pool has two entries — never the same one.
+        use aegis_proto::{IdentityId, PrekeyBundle, PublicKeyRecord};
+        let store = std::sync::Arc::new(
+            SqliteStore::open_in_memory()
+                .await
+                .expect("in-memory sqlite"),
+        );
+        let id = "amp:did:key:z6MkConcurrent";
+
+        let bundle = PrekeyBundle {
+            identity_id: IdentityId(id.to_string()),
+            signed_prekeys: vec![],
+            one_time_prekeys: vec![
+                PublicKeyRecord {
+                    key_id: "ot-a".to_string(),
+                    algorithm: "AMP-MLKEM768-V1".to_string(),
+                    public_key_b64: "QQ==".to_string(),
+                },
+                PublicKeyRecord {
+                    key_id: "ot-b".to_string(),
+                    algorithm: "AMP-MLKEM768-V1".to_string(),
+                    public_key_b64: "Qg==".to_string(),
+                },
+            ],
+            supported_suites: vec![],
+            expires_at: None,
+            signature: Some("sig".to_string()),
+        };
+        store
+            .store_one_time_prekeys(&bundle)
+            .await
+            .expect("publish");
+
+        let s1 = std::sync::Arc::clone(&store);
+        let s2 = std::sync::Arc::clone(&store);
+        let id_a = id.to_string();
+        let id_b = id.to_string();
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { s1.claim_one_time_prekey(&id_a).await }),
+            tokio::spawn(async move { s2.claim_one_time_prekey(&id_b).await }),
+        );
+
+        let claimed_1 = r1.expect("join 1").expect("claim 1").expect("got prekey 1");
+        let claimed_2 = r2.expect("join 2").expect("claim 2").expect("got prekey 2");
+        assert_ne!(
+            claimed_1.key_id, claimed_2.key_id,
+            "concurrent claims must return distinct prekeys"
+        );
+
+        // Pool now exhausted.
+        let third = store.claim_one_time_prekey(id).await.expect("claim 3");
+        assert!(third.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_one_time_prekey_returns_none_for_unknown_identity() {
+        let store = SqliteStore::open_in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let claimed = store
+            .claim_one_time_prekey("amp:did:key:z6MkNoSuchPk")
+            .await
+            .expect("claim");
+        assert!(claimed.is_none());
     }
 
     #[tokio::test]

@@ -123,6 +123,30 @@ pub async fn store_envelope(
                 &format!("prekey key_id {key_id} already consumed for recipient"),
             )
         }
+        Ok(StoreOutcome::UnknownPrekey { key_id }) => {
+            let recipient_id = req.envelope.recipient_id.0.clone();
+            let envelope_id = req.envelope.envelope_id.0.to_string();
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "consume_prekey",
+                    outcome: "unknown",
+                    recipient_id: Some(&recipient_id),
+                    envelope_id: Some(&envelope_id),
+                    identity_id: None,
+                    detail: Some(&key_id),
+                })
+                .await;
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "unknown_prekey",
+                &format!(
+                    "prekey key_id {key_id} was not published by recipient; \
+                     senders must claim a prekey before referencing it"
+                ),
+            )
+        }
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "storage_error",
@@ -442,15 +466,27 @@ mod tests {
     };
 
     async fn test_app(token: Option<&str>) -> Router {
+        test_app_with_config(token, false).await.0
+    }
+
+    /// Returns `(router, store)` so tests that need to seed state directly
+    /// (e.g. publishing a prekey before posting a referencing envelope) can
+    /// do so without going through HTTP.
+    async fn test_app_with_store(token: Option<&str>) -> (Router, std::sync::Arc<SqliteStore>) {
         test_app_with_config(token, false).await
     }
 
-    async fn test_app_with_config(token: Option<&str>, require_token_for_push: bool) -> Router {
-        let store = SqliteStore::open_in_memory()
-            .await
-            .expect("sqlite in-memory");
+    async fn test_app_with_config(
+        token: Option<&str>,
+        require_token_for_push: bool,
+    ) -> (Router, std::sync::Arc<SqliteStore>) {
+        let store = std::sync::Arc::new(
+            SqliteStore::open_in_memory()
+                .await
+                .expect("sqlite in-memory"),
+        );
         let state = Arc::new(AppState {
-            store: Arc::new(store),
+            store: store.clone(),
             auth: RelayAuthConfig {
                 mode: if token.is_some() {
                     AuthMode::Token
@@ -467,7 +503,7 @@ mod tests {
             },
             audit: AuditSink::new(None),
         });
-        Router::new()
+        let router = Router::new()
             .route("/healthz", get(super::healthz))
             .route("/v1/status", get(super::status))
             .route("/v1/envelopes", post(super::store_envelope))
@@ -481,7 +517,31 @@ mod tests {
                 delete(super::delete_envelope),
             )
             .route("/v1/cleanup", post(super::cleanup_store))
-            .with_state(state)
+            .with_state(state);
+        (router, store)
+    }
+
+    /// Publish one one-time prekey directly on `store` so the route's
+    /// published-check passes when an envelope references `key_id`.
+    async fn seed_prekey(store: &SqliteStore, recipient: &str, key_id: &str) {
+        use crate::storage::Store;
+        use aegis_proto::{IdentityId, PrekeyBundle, PublicKeyRecord};
+        let bundle = PrekeyBundle {
+            identity_id: IdentityId(recipient.to_string()),
+            signed_prekeys: vec![],
+            one_time_prekeys: vec![PublicKeyRecord {
+                key_id: key_id.to_string(),
+                algorithm: "AMP-MLKEM768-V1".to_string(),
+                public_key_b64: "AAAA".to_string(),
+            }],
+            supported_suites: vec![],
+            expires_at: None,
+            signature: Some("seed-sig".to_string()),
+        };
+        store
+            .store_one_time_prekeys(&bundle)
+            .await
+            .expect("seed prekey");
     }
 
     #[tokio::test]
@@ -834,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_route_requires_token_when_configured_and_enabled() {
-        let app = test_app_with_config(Some("dev-token"), true).await;
+        let (app, _store) = test_app_with_config(Some("dev-token"), true).await;
 
         let envelope_json = r#"{
           "envelope": {
@@ -929,7 +989,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_envelope_with_prekey_succeeds_first_time() {
-        let app = test_app(None).await;
+        let (app, store) = test_app_with_store(None).await;
+        seed_prekey(&store, "amp:did:key:z6MkPkRoute", "pk-route-1").await;
         let req = Request::builder()
             .method("POST")
             .uri("/v1/envelopes")
@@ -944,8 +1005,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_envelope_replaying_prekey_returns_409_prekey_already_used() {
+    async fn store_envelope_unknown_prekey_returns_400_unknown_prekey() {
         let app = test_app(None).await;
+        // No prekey published — published-check should reject.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_with_prekey_json(
+                "55555555-5555-5555-5555-555555555555",
+                &["pk-not-published"],
+            )))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["code"], "unknown_prekey");
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pk-not-published"));
+    }
+
+    #[tokio::test]
+    async fn store_envelope_replaying_prekey_returns_409_prekey_already_used() {
+        let (app, store) = test_app_with_store(None).await;
+        seed_prekey(&store, "amp:did:key:z6MkPkRoute", "pk-route-replay").await;
 
         // First envelope claims pk-route-replay -- accepted.
         let first = Request::builder()

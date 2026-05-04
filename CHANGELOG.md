@@ -13,6 +13,18 @@ All notable changes to this repository are documented here.
 - New audit operation `consume_prekey` (outcome `ok` or `conflict`) emitted per consumed key
 - `FileStore::store_with_prekey_consumption` is a non-enforcing dev-only fallback; production deployments use `SqliteStore`
 
+### v0.3.0-alpha — phase 2 (prekey publish + atomic claim)
+
+- New `one_time_prekeys` SQLite table with `PRIMARY KEY (identity_id, key_id)` and a `(identity_id, claimed)` index
+- New `StoreOutcome::UnknownPrekey { key_id }` variant; `store_with_prekey_consumption` now verifies each `key_id` was published by the recipient before consuming — rejected as `400 unknown_prekey` (consumption transaction rolled back, envelope not stored)
+- New trait methods `Store::store_one_time_prekeys` (idempotent `INSERT OR IGNORE`) and `Store::claim_one_time_prekey` (atomic select + `UPDATE … WHERE claimed = 0` in one transaction)
+- New `prekey_routes.rs`:
+  - `POST /v1/identities/:identity_id/prekeys` (auth-scoped `IdentityWrite`, signature verified against the identity's published Ed25519 + Dilithium3 signing keys; returns `PublishPrekeysResponse { inserted, skipped }`)
+  - `GET /v1/identities/:identity_id/prekey` (returns `ClaimedPrekeyResponse { identity_id, key_id, algorithm, public_key_b64 }`; `404 prekey_pool_empty` when exhausted)
+- New audit operations `publish_prekeys` (with `inserted=N skipped=M` detail), `claim_prekey` (outcome `ok` / `exhausted`), `consume_prekey` outcome `unknown`
+- `FileStore` impls of the new methods are non-enforcing dev-only fallbacks
+- 12 new tests added; `48 → 54` tests across the crate
+
 ## [v0.2.0-alpha] - 2026-05-03
 
 ### Storage

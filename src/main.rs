@@ -1,6 +1,7 @@
 mod audit;
 mod config;
 mod identity_routes;
+mod prekey_routes;
 mod routes;
 mod storage;
 
@@ -59,6 +60,14 @@ async fn main() {
             put(identity_routes::put_identity),
         )
         .route("/v1/aliases/:alias", get(identity_routes::get_alias))
+        .route(
+            "/v1/identities/:identity_id/prekeys",
+            post(prekey_routes::publish_prekeys),
+        )
+        .route(
+            "/v1/identities/:identity_id/prekey",
+            get(prekey_routes::claim_prekey),
+        )
         .with_state(state);
 
     let addr: SocketAddr = cfg.bind.parse().expect("invalid AEGIS_RELAY_BIND address");
