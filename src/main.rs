@@ -96,6 +96,26 @@ async fn main() {
         .route("/admin/cleanup", post(admin_routes::admin_cleanup))
         .route("/admin/identities", get(admin_routes::admin_list_identities))
         .route("/admin/audit", get(admin_routes::admin_audit_log))
+        .route(
+            "/admin/domains",
+            get(admin_routes::admin_list_domains).post(admin_routes::admin_claim_domain),
+        )
+        .route(
+            "/admin/domains/:domain/verify",
+            post(admin_routes::admin_verify_domain),
+        )
+        .route(
+            "/admin/domains/:domain",
+            delete(admin_routes::admin_release_domain),
+        )
+        .route(
+            "/admin/users",
+            get(admin_routes::admin_list_users).post(admin_routes::admin_provision_user),
+        )
+        .route(
+            "/admin/users/:alias",
+            delete(admin_routes::admin_deprovision_user),
+        )
         .with_state(state)
         .layer(
             CorsLayer::new()

@@ -65,6 +65,45 @@ pub struct IdentityListEntry {
     pub updated_at: String,
 }
 
+/// One row from the served-domains table.
+#[derive(Debug, Clone)]
+pub struct DomainEntry {
+    pub domain: String,
+    pub verification_token: String,
+    pub verified_at: Option<String>,
+    pub added_at: String,
+}
+
+/// One row from the provisioned-users roster.
+#[derive(Debug, Clone)]
+pub struct ProvisionedUserEntry {
+    pub alias: String,
+    pub identity_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Outcome of `provision_user`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionOutcome {
+    Created,
+    AlreadyExists,
+    DomainNotServed,
+}
+
+/// Outcome of `claim_provisioned_alias` — used during identity PUT to enforce
+/// that an alias reserved for one identity_id cannot be hijacked by another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimAliasOutcome {
+    /// Alias not in roster — allow without binding (open mode).
+    NotProvisioned,
+    /// Alias bound to this identity_id (either fresh claim or matches existing).
+    Bound,
+    /// Alias bound to a different identity_id — reject.
+    OwnedByOther { identity_id: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayMetrics {
     pub envelopes_total: usize,
@@ -148,6 +187,76 @@ pub trait Store: Send + Sync {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<IdentityListEntry>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // -- Served domains -------------------------------------------------------
+
+    async fn list_served_domains(
+        &self,
+    ) -> Result<Vec<DomainEntry>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Add a domain claim with a freshly-generated verification token.
+    /// Returns the existing entry if the domain is already claimed (idempotent).
+    async fn add_served_domain(
+        &self,
+        domain: &str,
+        verification_token: &str,
+    ) -> Result<DomainEntry, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn get_served_domain(
+        &self,
+        domain: &str,
+    ) -> Result<Option<DomainEntry>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Mark a domain as verified. Returns `false` if the domain is not claimed.
+    async fn mark_domain_verified(
+        &self,
+        domain: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Release a domain. Cascades alias purge for all identities claiming
+    /// addresses under this domain. Returns the number of aliases removed.
+    async fn release_served_domain(
+        &self,
+        domain: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// True iff at least one verified domain is configured (i.e. relay is in
+    /// "managed" mode rather than open-publish).
+    async fn has_served_domains(
+        &self,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    // -- Provisioned users ----------------------------------------------------
+
+    async fn list_provisioned_users(
+        &self,
+        domain_filter: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ProvisionedUserEntry>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Reserve an alias for future identity binding.
+    /// Returns `DomainNotServed` if the alias domain is not in `served_domains`
+    /// or `AlreadyExists` if the alias is already provisioned.
+    async fn provision_user(
+        &self,
+        alias: &str,
+    ) -> Result<ProvisionOutcome, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Remove a provisioned-user reservation (and the alias index row).
+    /// Returns `false` if the alias was not provisioned.
+    async fn deprovision_user(
+        &self,
+        alias: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Check whether an alias is provisioned and to whom. Used at identity
+    /// PUT time to gate alias binding.
+    async fn claim_provisioned_alias(
+        &self,
+        alias: &str,
+        identity_id: &str,
+    ) -> Result<ClaimAliasOutcome, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +570,83 @@ impl Store for FileStore {
         // FileStore is a dev scaffold — pagination not implemented.
         Ok(vec![])
     }
+
+    async fn list_served_domains(
+        &self,
+    ) -> Result<Vec<DomainEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![])
+    }
+
+    async fn add_served_domain(
+        &self,
+        domain: &str,
+        verification_token: &str,
+    ) -> Result<DomainEntry, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(DomainEntry {
+            domain: domain.to_string(),
+            verification_token: verification_token.to_string(),
+            verified_at: None,
+            added_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    async fn get_served_domain(
+        &self,
+        _domain: &str,
+    ) -> Result<Option<DomainEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn mark_domain_verified(
+        &self,
+        _domain: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
+    async fn release_served_domain(
+        &self,
+        _domain: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(0)
+    }
+
+    async fn has_served_domains(
+        &self,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
+    async fn list_provisioned_users(
+        &self,
+        _domain_filter: Option<&str>,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<Vec<ProvisionedUserEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![])
+    }
+
+    async fn provision_user(
+        &self,
+        _alias: &str,
+    ) -> Result<ProvisionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(ProvisionOutcome::DomainNotServed)
+    }
+
+    async fn deprovision_user(
+        &self,
+        _alias: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
+    async fn claim_provisioned_alias(
+        &self,
+        _alias: &str,
+        _identity_id: &str,
+    ) -> Result<ClaimAliasOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(ClaimAliasOutcome::NotProvisioned)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +696,21 @@ const MIGRATIONS: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_one_time_prekeys_unclaimed
         ON one_time_prekeys(identity_id, claimed);
+    CREATE TABLE IF NOT EXISTS served_domains (
+        domain TEXT PRIMARY KEY,
+        verification_token TEXT NOT NULL,
+        verified_at TEXT,
+        added_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS provisioned_users (
+        alias TEXT PRIMARY KEY,
+        identity_id TEXT,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_provisioned_users_identity_id
+        ON provisioned_users(identity_id);
 ";
 
 pub struct SqliteStore {
@@ -1014,6 +1215,374 @@ impl Store for SqliteStore {
 
         Ok(entries)
     }
+
+    async fn list_served_domains(
+        &self,
+    ) -> Result<Vec<DomainEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT domain, verification_token, verified_at, added_at \
+                     FROM served_domains \
+                     ORDER BY added_at ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(domain, verification_token, verified_at, added_at)| DomainEntry {
+                domain,
+                verification_token,
+                verified_at,
+                added_at,
+            })
+            .collect())
+    }
+
+    async fn add_served_domain(
+        &self,
+        domain: &str,
+        verification_token: &str,
+    ) -> Result<DomainEntry, Box<dyn std::error::Error + Send + Sync>> {
+        let domain_owned = domain.to_string();
+        let token_owned = verification_token.to_string();
+        let added_at = Utc::now().to_rfc3339();
+        let entry = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let existing = tx
+                    .query_row(
+                        "SELECT verification_token, verified_at, added_at \
+                         FROM served_domains WHERE domain = ?1",
+                        rusqlite::params![domain_owned],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let entry = if let Some((token, verified_at, added)) = existing {
+                    DomainEntry {
+                        domain: domain_owned.clone(),
+                        verification_token: token,
+                        verified_at,
+                        added_at: added,
+                    }
+                } else {
+                    tx.execute(
+                        "INSERT INTO served_domains \
+                         (domain, verification_token, verified_at, added_at) \
+                         VALUES (?1, ?2, NULL, ?3)",
+                        rusqlite::params![domain_owned, token_owned, added_at],
+                    )?;
+                    DomainEntry {
+                        domain: domain_owned.clone(),
+                        verification_token: token_owned,
+                        verified_at: None,
+                        added_at,
+                    }
+                };
+                tx.commit()?;
+                Ok(entry)
+            })
+            .await?;
+        Ok(entry)
+    }
+
+    async fn get_served_domain(
+        &self,
+        domain: &str,
+    ) -> Result<Option<DomainEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let domain_owned = domain.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT domain, verification_token, verified_at, added_at \
+                         FROM served_domains WHERE domain = ?1",
+                        rusqlite::params![domain_owned],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await?;
+        Ok(row.map(|(domain, verification_token, verified_at, added_at)| DomainEntry {
+            domain,
+            verification_token,
+            verified_at,
+            added_at,
+        }))
+    }
+
+    async fn mark_domain_verified(
+        &self,
+        domain: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let domain_owned = domain.to_string();
+        let verified_at = Utc::now().to_rfc3339();
+        let n = self
+            .conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE served_domains SET verified_at = ?1 WHERE domain = ?2",
+                    rusqlite::params![verified_at, domain_owned],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn release_served_domain(
+        &self,
+        domain: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let domain_owned = domain.to_string();
+        let suffix = format!("@{}", domain_owned);
+        let removed = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let aliases_removed = tx.execute(
+                    "DELETE FROM identity_aliases \
+                     WHERE alias LIKE ?1 ESCAPE '\\'",
+                    rusqlite::params![format!("%{}", escape_like(&suffix))],
+                )?;
+                tx.execute(
+                    "DELETE FROM provisioned_users \
+                     WHERE alias LIKE ?1 ESCAPE '\\'",
+                    rusqlite::params![format!("%{}", escape_like(&suffix))],
+                )?;
+                tx.execute(
+                    "DELETE FROM served_domains WHERE domain = ?1",
+                    rusqlite::params![domain_owned],
+                )?;
+                tx.commit()?;
+                Ok(aliases_removed)
+            })
+            .await?;
+        Ok(removed)
+    }
+
+    async fn has_served_domains(
+        &self,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let count: i64 = self
+            .conn
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM served_domains WHERE verified_at IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(count > 0)
+    }
+
+    async fn list_provisioned_users(
+        &self,
+        domain_filter: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ProvisionedUserEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let filter_owned = domain_filter.map(|s| format!("%@{}", escape_like(s)));
+        let rows = self
+            .conn
+            .call(move |conn| {
+                let map_row = |row: &rusqlite::Row<'_>| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                };
+                if let Some(pattern) = filter_owned {
+                    let mut stmt = conn.prepare(
+                        "SELECT alias, identity_id, status, created_at, updated_at \
+                         FROM provisioned_users \
+                         WHERE alias LIKE ?1 ESCAPE '\\' \
+                         ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                    )?;
+                    let rows = stmt
+                        .query_map(
+                            rusqlite::params![pattern, limit as i64, offset as i64],
+                            map_row,
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                } else {
+                    let mut stmt = conn.prepare(
+                        "SELECT alias, identity_id, status, created_at, updated_at \
+                         FROM provisioned_users \
+                         ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                    )?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![limit as i64, offset as i64], map_row)?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                }
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(alias, identity_id, status, created_at, updated_at)| ProvisionedUserEntry {
+                alias,
+                identity_id,
+                status,
+                created_at,
+                updated_at,
+            })
+            .collect())
+    }
+
+    async fn provision_user(
+        &self,
+        alias: &str,
+    ) -> Result<ProvisionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let domain = match alias.split_once('@') {
+            Some((_, d)) if !d.is_empty() => d.to_string(),
+            _ => return Ok(ProvisionOutcome::DomainNotServed),
+        };
+        let alias_owned = alias.to_string();
+        let now = Utc::now().to_rfc3339();
+        let outcome = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let domain_ok: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM served_domains \
+                         WHERE domain = ?1 AND verified_at IS NOT NULL",
+                        rusqlite::params![domain],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if domain_ok.is_none() {
+                    return Ok(ProvisionOutcome::DomainNotServed);
+                }
+                let exists: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM provisioned_users WHERE alias = ?1",
+                        rusqlite::params![alias_owned],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if exists.is_some() {
+                    return Ok(ProvisionOutcome::AlreadyExists);
+                }
+                tx.execute(
+                    "INSERT INTO provisioned_users \
+                     (alias, identity_id, status, created_at, updated_at) \
+                     VALUES (?1, NULL, 'provisioned', ?2, ?2)",
+                    rusqlite::params![alias_owned, now],
+                )?;
+                tx.commit()?;
+                Ok(ProvisionOutcome::Created)
+            })
+            .await?;
+        Ok(outcome)
+    }
+
+    async fn deprovision_user(
+        &self,
+        alias: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let alias_owned = alias.to_string();
+        let removed = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let n = tx.execute(
+                    "DELETE FROM provisioned_users WHERE alias = ?1",
+                    rusqlite::params![alias_owned],
+                )?;
+                tx.execute(
+                    "DELETE FROM identity_aliases WHERE alias = ?1",
+                    rusqlite::params![alias_owned],
+                )?;
+                tx.commit()?;
+                Ok(n)
+            })
+            .await?;
+        Ok(removed > 0)
+    }
+
+    async fn claim_provisioned_alias(
+        &self,
+        alias: &str,
+        identity_id: &str,
+    ) -> Result<ClaimAliasOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let alias_owned = alias.to_string();
+        let identity_owned = identity_id.to_string();
+        let now = Utc::now().to_rfc3339();
+        let outcome = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let row: Option<Option<String>> = tx
+                    .query_row(
+                        "SELECT identity_id FROM provisioned_users WHERE alias = ?1",
+                        rusqlite::params![alias_owned],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                let outcome = match row {
+                    None => ClaimAliasOutcome::NotProvisioned,
+                    Some(None) => {
+                        tx.execute(
+                            "UPDATE provisioned_users \
+                             SET identity_id = ?1, status = 'active', updated_at = ?2 \
+                             WHERE alias = ?3",
+                            rusqlite::params![identity_owned, now, alias_owned],
+                        )?;
+                        ClaimAliasOutcome::Bound
+                    }
+                    Some(Some(existing)) if existing == identity_owned => {
+                        ClaimAliasOutcome::Bound
+                    }
+                    Some(Some(other)) => ClaimAliasOutcome::OwnedByOther { identity_id: other },
+                };
+                tx.commit()?;
+                Ok(outcome)
+            })
+            .await?;
+        Ok(outcome)
+    }
+}
+
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,7 +1609,10 @@ fn is_expired(envelope: &Envelope) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileStore, LifecycleOutcome, SqliteStore, Store, StoreOutcome};
+    use super::{
+        ClaimAliasOutcome, FileStore, LifecycleOutcome, ProvisionOutcome, SqliteStore, Store,
+        StoreOutcome,
+    };
     use crate::config::RetentionPolicy;
     use aegis_proto::{
         EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
@@ -1754,6 +2326,139 @@ mod tests {
             .await
             .expect("claim");
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn served_domain_lifecycle() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+
+        assert!(!store.has_served_domains().await.unwrap());
+
+        let entry = store
+            .add_served_domain("Example.COM", "tok-abc")
+            .await
+            .expect("add");
+        assert_eq!(entry.domain, "Example.COM");
+        assert!(entry.verified_at.is_none());
+
+        // Idempotent re-add returns existing entry, doesn't reset token.
+        let again = store
+            .add_served_domain("Example.COM", "different-token")
+            .await
+            .expect("add again");
+        assert_eq!(again.verification_token, "tok-abc");
+
+        // has_served_domains is verified-only.
+        assert!(!store.has_served_domains().await.unwrap());
+
+        let ok = store.mark_domain_verified("Example.COM").await.unwrap();
+        assert!(ok);
+        assert!(store.has_served_domains().await.unwrap());
+
+        let fetched = store
+            .get_served_domain("Example.COM")
+            .await
+            .unwrap()
+            .expect("present");
+        assert!(fetched.verified_at.is_some());
+
+        let removed = store.release_served_domain("Example.COM").await.unwrap();
+        assert_eq!(removed, 0);
+        assert!(store.get_served_domain("Example.COM").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn provision_user_requires_verified_domain() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+
+        let outcome = store.provision_user("alice@example.com").await.unwrap();
+        assert_eq!(outcome, ProvisionOutcome::DomainNotServed);
+
+        store
+            .add_served_domain("example.com", "tok-1")
+            .await
+            .unwrap();
+        // Domain claimed but not yet verified — still rejected.
+        let outcome = store.provision_user("alice@example.com").await.unwrap();
+        assert_eq!(outcome, ProvisionOutcome::DomainNotServed);
+
+        store.mark_domain_verified("example.com").await.unwrap();
+        let outcome = store.provision_user("alice@example.com").await.unwrap();
+        assert_eq!(outcome, ProvisionOutcome::Created);
+
+        let outcome = store.provision_user("alice@example.com").await.unwrap();
+        assert_eq!(outcome, ProvisionOutcome::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn claim_provisioned_alias_blocks_hijack() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        store
+            .add_served_domain("example.com", "tok-1")
+            .await
+            .unwrap();
+        store.mark_domain_verified("example.com").await.unwrap();
+        store.provision_user("bob@example.com").await.unwrap();
+
+        let bound = store
+            .claim_provisioned_alias("bob@example.com", "amp:did:key:zBob")
+            .await
+            .unwrap();
+        assert_eq!(bound, ClaimAliasOutcome::Bound);
+
+        // Same identity rebinding is fine.
+        let bound_again = store
+            .claim_provisioned_alias("bob@example.com", "amp:did:key:zBob")
+            .await
+            .unwrap();
+        assert_eq!(bound_again, ClaimAliasOutcome::Bound);
+
+        // Different identity is rejected.
+        let other = store
+            .claim_provisioned_alias("bob@example.com", "amp:did:key:zEve")
+            .await
+            .unwrap();
+        assert!(matches!(other, ClaimAliasOutcome::OwnedByOther { .. }));
+
+        // Unprovisioned alias is allowed (open binding).
+        let np = store
+            .claim_provisioned_alias("nobody@example.com", "amp:did:key:zEve")
+            .await
+            .unwrap();
+        assert_eq!(np, ClaimAliasOutcome::NotProvisioned);
+    }
+
+    #[tokio::test]
+    async fn release_domain_purges_aliases_and_provisions() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        store
+            .add_served_domain("example.com", "tok-1")
+            .await
+            .unwrap();
+        store.mark_domain_verified("example.com").await.unwrap();
+        store.provision_user("alice@example.com").await.unwrap();
+
+        // Insert a fake alias row directly to simulate an active identity.
+        store
+            .conn
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO identity_aliases (alias, identity_id) VALUES (?1, ?2)",
+                    rusqlite::params!["alice@example.com", "amp:did:key:zAlice"],
+                )
+                .map_err(|e| e.into())
+            })
+            .await
+            .unwrap();
+
+        let removed = store.release_served_domain("example.com").await.unwrap();
+        assert_eq!(removed, 1);
+
+        let users = store
+            .list_provisioned_users(Some("example.com"), 0, 10)
+            .await
+            .unwrap();
+        assert!(users.is_empty());
     }
 
     #[tokio::test]
