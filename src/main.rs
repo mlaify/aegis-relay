@@ -1,6 +1,7 @@
 mod admin_routes;
 mod audit;
 mod config;
+mod discovery;
 mod identity_routes;
 mod prekey_routes;
 mod routes;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub audit: audit::AuditSink,
     pub runtime_config_path: PathBuf,
+    pub public_url: Option<String>,
 }
 
 #[tokio::main]
@@ -38,6 +40,7 @@ async fn main() {
     let admin_token = cfg.admin_token.clone();
     let audit_log_path = cfg.audit_log_path.clone();
     let bind = cfg.bind.clone();
+    let public_url = cfg.public_url.clone();
     let runtime = cfg.into_shared_runtime();
 
     let state = Arc::new(AppState {
@@ -46,9 +49,14 @@ async fn main() {
         admin_token,
         audit: audit::AuditSink::new(audit_log_path),
         runtime_config_path,
+        public_url,
     });
 
     let app = Router::new()
+        .route(
+            "/.well-known/aegis-config",
+            get(discovery::well_known_aegis_config),
+        )
         .route("/healthz", get(routes::healthz))
         .route("/v1/status", get(routes::status))
         .route("/v1/envelopes", post(routes::store_envelope))
