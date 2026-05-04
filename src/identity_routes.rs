@@ -48,6 +48,57 @@ pub async fn put_identity(
         return bad_request("invalid_signature", &msg);
     }
 
+    // Domain gating: when the relay has any verified domains, aliases are
+    // restricted to those domains and any pre-provisioned reservations.
+    let managed_mode = match state.store.has_served_domains().await {
+        Ok(v) => v,
+        Err(_) => return internal_error("storage_error", "failed to check domains"),
+    };
+    if managed_mode {
+        for alias in &doc.aliases {
+            let lower = alias.trim().to_ascii_lowercase();
+            let domain = match lower.split_once('@') {
+                Some((local, dom)) if !local.is_empty() && !dom.is_empty() => dom.to_string(),
+                _ => {
+                    return bad_request(
+                        "invalid_alias",
+                        &format!("alias '{}' must be in user@domain form on a managed relay", alias),
+                    );
+                }
+            };
+            match state.store.get_served_domain(&domain).await {
+                Ok(Some(entry)) if entry.verified_at.is_some() => {}
+                Ok(_) => {
+                    return forbidden(
+                        "domain_not_served",
+                        &format!("domain '{}' is not served by this relay", domain),
+                    );
+                }
+                Err(_) => return internal_error("storage_error", "failed to check domain"),
+            }
+            match state.store.claim_provisioned_alias(&lower, &doc.identity_id.0).await {
+                Ok(crate::storage::ClaimAliasOutcome::Bound)
+                | Ok(crate::storage::ClaimAliasOutcome::NotProvisioned) => {}
+                Ok(crate::storage::ClaimAliasOutcome::OwnedByOther { .. }) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(RelayErrorResponse {
+                            error: RelayError {
+                                code: "alias_owned_by_other".into(),
+                                message: format!(
+                                    "alias '{}' is reserved for a different identity",
+                                    alias
+                                ),
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(_) => return internal_error("storage_error", "alias claim failed"),
+            }
+        }
+    }
+
     match state.store.store_identity(&doc).await {
         Ok(()) => {
             state
@@ -155,6 +206,19 @@ fn verify_doc_signature(doc: &IdentityDocument) -> Result<(), String> {
 fn bad_request(code: &str, message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
+        Json(RelayErrorResponse {
+            error: RelayError {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn forbidden(code: &str, message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
         Json(RelayErrorResponse {
             error: RelayError {
                 code: code.to_string(),
