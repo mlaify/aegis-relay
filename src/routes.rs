@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 
-use crate::storage::LifecycleOutcome;
+use crate::storage::{LifecycleOutcome, StoreOutcome};
 use crate::{audit::AuditEvent, config::AuthMode, AppState};
 
 pub async fn healthz() -> &'static str {
@@ -62,8 +62,12 @@ pub async fn store_envelope(
         return error_response(StatusCode::BAD_REQUEST, "invalid_envelope", &message);
     }
 
-    match state.store.store(&req.envelope).await {
-        Ok(()) => {
+    match state
+        .store
+        .store_with_prekey_consumption(&req.envelope)
+        .await
+    {
+        Ok(StoreOutcome::Stored) => {
             let recipient_id = req.envelope.recipient_id.0.clone();
             let envelope_id = req.envelope.envelope_id.0.to_string();
             state
@@ -78,11 +82,46 @@ pub async fn store_envelope(
                     detail: None,
                 })
                 .await;
+            for key_id in &req.envelope.used_prekey_ids {
+                state
+                    .audit
+                    .record(AuditEvent {
+                        at: chrono::Utc::now(),
+                        operation: "consume_prekey",
+                        outcome: "ok",
+                        recipient_id: Some(&recipient_id),
+                        envelope_id: Some(&envelope_id),
+                        identity_id: None,
+                        detail: Some(key_id),
+                    })
+                    .await;
+            }
             Json(StoreEnvelopeResponse {
                 accepted: true,
                 relay_id: "local-relay".to_string(),
             })
             .into_response()
+        }
+        Ok(StoreOutcome::PrekeyAlreadyUsed { key_id }) => {
+            let recipient_id = req.envelope.recipient_id.0.clone();
+            let envelope_id = req.envelope.envelope_id.0.to_string();
+            state
+                .audit
+                .record(AuditEvent {
+                    at: chrono::Utc::now(),
+                    operation: "consume_prekey",
+                    outcome: "conflict",
+                    recipient_id: Some(&recipient_id),
+                    envelope_id: Some(&envelope_id),
+                    identity_id: None,
+                    detail: Some(&key_id),
+                })
+                .await;
+            error_response(
+                StatusCode::CONFLICT,
+                "prekey_already_used",
+                &format!("prekey key_id {key_id} already consumed for recipient"),
+            )
         }
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -90,6 +129,16 @@ pub async fn store_envelope(
             "failed to store envelope",
         ),
     }
+}
+
+fn first_duplicate(ids: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Some(id.as_str());
+        }
+    }
+    None
 }
 
 fn validate_envelope(envelope: &aegis_proto::Envelope) -> Result<(), String> {
@@ -115,6 +164,16 @@ fn validate_envelope(envelope: &aegis_proto::Envelope) -> Result<(), String> {
 
     if envelope.payload.ciphertext_b64.trim().is_empty() {
         return Err("payload.ciphertext_b64 must be non-empty".to_string());
+    }
+
+    // RFC-0003 §12: each key_id in used_prekey_ids must be unique.
+    if let Some(dup) = first_duplicate(&envelope.used_prekey_ids) {
+        return Err(format!("used_prekey_ids contains duplicate key_id {dup}"));
+    }
+    for key_id in &envelope.used_prekey_ids {
+        if key_id.trim().is_empty() {
+            return Err("used_prekey_ids entries must be non-empty".to_string());
+        }
     }
 
     // Hybrid PQ suite requires KEM transport fields and a PQ signature.
@@ -838,5 +897,114 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json["auth_mode"], "open");
         assert!(json["envelopes_total"].is_number());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prekey enforcement route tests (RFC-0003 §12, RFC-0004 §5/§17)
+    // -----------------------------------------------------------------------
+
+    fn envelope_with_prekey_json(envelope_id: &str, prekey_ids: &[&str]) -> String {
+        let ids_json = serde_json::to_string(prekey_ids).expect("ids");
+        format!(
+            r#"{{
+              "envelope": {{
+                "version": 1,
+                "envelope_id": "{envelope_id}",
+                "recipient_id": "amp:did:key:z6MkPkRoute",
+                "sender_hint": null,
+                "created_at": "2026-05-04T10:00:00Z",
+                "expires_at": null,
+                "content_type": "message/private",
+                "suite_id": "DemoXChaCha20Poly1305",
+                "used_prekey_ids": {ids_json},
+                "payload": {{
+                  "nonce_b64": "bm9uY2U=",
+                  "ciphertext_b64": "Y2lwaGVydGV4dA=="
+                }},
+                "outer_signature_b64": null
+              }}
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn store_envelope_with_prekey_succeeds_first_time() {
+        let app = test_app(None).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_with_prekey_json(
+                "11111111-1111-1111-1111-111111111111",
+                &["pk-route-1"],
+            )))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn store_envelope_replaying_prekey_returns_409_prekey_already_used() {
+        let app = test_app(None).await;
+
+        // First envelope claims pk-route-replay -- accepted.
+        let first = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_with_prekey_json(
+                "22222222-2222-2222-2222-222222222222",
+                &["pk-route-replay"],
+            )))
+            .expect("first");
+        let first_resp = app.clone().oneshot(first).await.expect("first response");
+        assert_eq!(first_resp.status(), StatusCode::OK);
+
+        // Second envelope reuses the same prekey id -- rejected with 409.
+        let second = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_with_prekey_json(
+                "33333333-3333-3333-3333-333333333333",
+                &["pk-route-replay"],
+            )))
+            .expect("second");
+        let second_resp = app.oneshot(second).await.expect("second response");
+        assert_eq!(second_resp.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(second_resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["code"], "prekey_already_used");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pk-route-replay"),
+            "error message must identify the offending key_id, got: {}",
+            json["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_envelope_with_duplicate_prekey_ids_returns_400() {
+        let app = test_app(None).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(envelope_with_prekey_json(
+                "44444444-4444-4444-4444-444444444444",
+                &["pk-dup", "pk-dup"],
+            )))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["code"], "invalid_envelope");
     }
 }
