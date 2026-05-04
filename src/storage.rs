@@ -57,6 +57,14 @@ pub struct CleanupReport {
     pub old_removed: usize,
 }
 
+/// One row from the admin identity list.
+#[derive(Debug, Clone)]
+pub struct IdentityListEntry {
+    pub identity_id: String,
+    pub aliases: Vec<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayMetrics {
     pub envelopes_total: usize,
@@ -134,6 +142,12 @@ pub trait Store: Send + Sync {
         &self,
         identity_id: &str,
     ) -> Result<Option<ClaimedPrekey>, Box<dyn std::error::Error + Send + Sync>>;
+    /// Paginated list of identities ordered by `updated_at DESC`.
+    async fn list_identities(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<IdentityListEntry>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +451,15 @@ impl Store for FileStore {
             envelopes_active,
             identities_total,
         })
+    }
+
+    async fn list_identities(
+        &self,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<Vec<IdentityListEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        // FileStore is a dev scaffold — pagination not implemented.
+        Ok(vec![])
     }
 }
 
@@ -943,6 +966,53 @@ impl Store for SqliteStore {
             })
             .await?;
         Ok(claimed)
+    }
+
+    async fn list_identities(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<IdentityListEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT identity_id, identity_json, updated_at \
+                     FROM identities \
+                     ORDER BY updated_at DESC \
+                     LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![limit as i64, offset as i64],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let entries = rows
+            .into_iter()
+            .map(|(identity_id, identity_json, updated_at)| {
+                let aliases = serde_json::from_str::<aegis_proto::IdentityDocument>(&identity_json)
+                    .map(|doc| doc.aliases)
+                    .unwrap_or_default();
+                IdentityListEntry {
+                    identity_id,
+                    aliases,
+                    updated_at,
+                }
+            })
+            .collect();
+
+        Ok(entries)
     }
 }
 
