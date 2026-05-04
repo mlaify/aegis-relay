@@ -45,10 +45,12 @@ dependencies = [
 name = "aegis-identity"
 version = "0.1.0"
 dependencies = [
+ "aegis-api-types",
  "aegis-proto",
  "base64",
  "ed25519-dalek",
  "pqcrypto-dilithium",
+ "pqcrypto-kyber",
  "pqcrypto-traits",
  "rand 0.8.6",
  "reqwest",
