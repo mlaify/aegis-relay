@@ -104,6 +104,21 @@ pub async fn store_envelope(
                     })
                     .await;
             }
+
+            // Phase 5 (#28): if this envelope arrived via federation
+            // (X-Aegis-Forwarded: true) we are the terminal hop — never
+            // re-federate. Otherwise check the recipient's identity doc
+            // and enqueue delivery if their relay_endpoints point
+            // somewhere that isn't us.
+            let was_forwarded = headers
+                .get(crate::federation::FORWARDED_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !was_forwarded {
+                crate::federation::maybe_enqueue(&state, &envelope_id, &recipient_id).await;
+            }
+
             Json(StoreEnvelopeResponse {
                 accepted: true,
                 relay_id: "local-relay".to_string(),
@@ -472,7 +487,7 @@ mod tests {
     use crate::{
         audit::AuditSink,
         config::RuntimeConfig,
-        storage::SqliteStore,
+        storage::{SqliteStore, Store},
     };
 
     async fn test_app(token: Option<&str>) -> Router {
@@ -649,6 +664,150 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json["error"]["code"], "storage_error");
         assert_eq!(json["error"]["message"], "failed to store envelope");
+    }
+
+    // --- Phase 5 federation gate (#28) -------------------------------------
+
+    #[tokio::test]
+    async fn store_envelope_enqueues_federation_when_recipient_has_remote_endpoint() {
+        // Recipient identity points at a remote relay → a normal POST
+        // /v1/envelopes triggers `maybe_enqueue`, which inserts a row
+        // into outbound_deliveries.
+        let (app, store) = test_app_with_store(None).await;
+
+        // Seed the recipient identity with relay_endpoints pointing
+        // at a remote relay.
+        let recipient_id = "amp:did:key:zRemoteRecipientFedTest";
+        let doc = aegis_proto::IdentityDocument {
+            version: 1,
+            identity_id: aegis_proto::IdentityId(recipient_id.to_string()),
+            aliases: vec![],
+            signing_keys: vec![aegis_proto::PublicKeyRecord {
+                key_id: "k-sign".into(),
+                algorithm: "AMP-ED25519-V1".into(),
+                public_key_b64: "AAAA".into(),
+            }],
+            encryption_keys: vec![aegis_proto::PublicKeyRecord {
+                key_id: "k-x25519".into(),
+                algorithm: "AMP-X25519-V1".into(),
+                public_key_b64: "BBBB".into(),
+            }],
+            supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".into()],
+            relay_endpoints: vec!["https://peer.example".into()],
+            signature: None,
+        };
+        store.store_identity(&doc).await.expect("seed identity");
+
+        // Build an envelope addressed to that recipient.
+        let envelope_id = uuid::Uuid::new_v4().to_string();
+        let body = format!(
+            r#"{{
+                "envelope": {{
+                    "version": 1,
+                    "envelope_id": "{}",
+                    "recipient_id": "{}",
+                    "sender_hint": null,
+                    "created_at": "2026-01-02T03:04:05Z",
+                    "expires_at": null,
+                    "content_type": "message/private",
+                    "suite_id": "DemoXChaCha20Poly1305",
+                    "used_prekey_ids": [],
+                    "payload": {{ "nonce_b64": "AAAA", "ciphertext_b64": "BBBB" }},
+                    "outer_signature_b64": null
+                }}
+            }}"#,
+            envelope_id, recipient_id,
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Federation row was enqueued.
+        let pending = store
+            .next_pending_delivery()
+            .await
+            .expect("query pending")
+            .expect("a pending delivery");
+        assert_eq!(pending.envelope_id, envelope_id);
+        assert_eq!(pending.target_url, "https://peer.example");
+    }
+
+    #[tokio::test]
+    async fn store_envelope_skips_federation_when_x_aegis_forwarded_header_set() {
+        // Same setup as above but the inbound POST carries
+        // X-Aegis-Forwarded: true → this relay is the terminal hop and
+        // must NOT re-federate.
+        let (app, store) = test_app_with_store(None).await;
+
+        let recipient_id = "amp:did:key:zForwardedTerminal";
+        let doc = aegis_proto::IdentityDocument {
+            version: 1,
+            identity_id: aegis_proto::IdentityId(recipient_id.to_string()),
+            aliases: vec![],
+            signing_keys: vec![aegis_proto::PublicKeyRecord {
+                key_id: "k-sign".into(),
+                algorithm: "AMP-ED25519-V1".into(),
+                public_key_b64: "AAAA".into(),
+            }],
+            encryption_keys: vec![aegis_proto::PublicKeyRecord {
+                key_id: "k-x25519".into(),
+                algorithm: "AMP-X25519-V1".into(),
+                public_key_b64: "BBBB".into(),
+            }],
+            supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".into()],
+            relay_endpoints: vec!["https://elsewhere.example".into()],
+            signature: None,
+        };
+        store.store_identity(&doc).await.expect("seed identity");
+
+        let envelope_id = uuid::Uuid::new_v4().to_string();
+        let body = format!(
+            r#"{{
+                "envelope": {{
+                    "version": 1,
+                    "envelope_id": "{}",
+                    "recipient_id": "{}",
+                    "sender_hint": null,
+                    "created_at": "2026-01-02T03:04:05Z",
+                    "expires_at": null,
+                    "content_type": "message/private",
+                    "suite_id": "DemoXChaCha20Poly1305",
+                    "used_prekey_ids": [],
+                    "payload": {{ "nonce_b64": "AAAA", "ciphertext_b64": "BBBB" }},
+                    "outer_signature_b64": null
+                }}
+            }}"#,
+            envelope_id, recipient_id,
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .header(crate::federation::FORWARDED_HEADER, "true")
+            .body(Body::from(body))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No federation row was enqueued (terminal hop).
+        let pending = store
+            .next_pending_delivery()
+            .await
+            .expect("query pending");
+        assert!(
+            pending.is_none(),
+            "X-Aegis-Forwarded must short-circuit federation, got {:?}",
+            pending
+        );
     }
 
     #[tokio::test]

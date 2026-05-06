@@ -1,0 +1,806 @@
+//! Phase 5 — relay-to-relay federation (push delivery). Tracking ticket:
+//! mlaify/aegis-relay#28.
+//!
+//! When this relay stores an envelope addressed to a recipient whose
+//! `IdentityDocument.relay_endpoints` contains a relay URL OTHER than
+//! our own, we push-deliver the envelope to that relay using its public
+//! `POST /v1/envelopes` endpoint — the same wire format senders use, so
+//! no new endpoints or formats are introduced.
+//!
+//! Loop prevention:
+//!   - The sender filters out its own `public_url` before enqueueing,
+//!     so we never schedule a delivery to ourselves.
+//!   - Outbound POSTs carry `X-Aegis-Forwarded: true`. The receiver checks
+//!     this header in `routes::store_envelope` and skips re-enqueueing —
+//!     federated envelopes are terminal.
+//!
+//! Trust:
+//!   - We do NOT decrypt the envelope. It's forwarded as the same opaque
+//!     blob the sender produced. The receiving relay's existing
+//!     `store_envelope` validation runs end-to-end.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde_json::json;
+
+use crate::AppState;
+
+/// The HTTP header that marks an inbound envelope as "delivered via
+/// federation; do not re-federate". Receiver short-circuits the
+/// `maybe_enqueue` path when this is present.
+pub const FORWARDED_HEADER: &str = "x-aegis-forwarded";
+
+/// Default cap on retry attempts. Configurable via
+/// `AEGIS_FEDERATION_MAX_ATTEMPTS`. After this many failures the row is
+/// marked `expired` and the local envelope copy is left in place for the
+/// operator to investigate.
+const DEFAULT_MAX_ATTEMPTS: u32 = 7;
+
+/// How long to nap when the queue is empty. Short enough that newly-
+/// enqueued items get picked up quickly, long enough that we don't burn
+/// CPU on a busy-loop poll.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// HTTP request timeout per delivery attempt. Federation peers are
+/// expected to respond quickly; longer than this and the network has
+/// likely failed.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Backoff schedule indexed by attempt count (0-based). Returns the
+/// delay before the *next* attempt — pure function so it's easy to test.
+///
+/// 0 → 0s   (first attempt, scheduled immediately on enqueue)
+/// 1 → 1m
+/// 2 → 5m
+/// 3 → 15m
+/// 4 → 1h
+/// 5 → 6h
+/// 6 → 24h
+/// 7+ → out of attempts → caller marks expired
+pub fn next_backoff(attempts: u32) -> Option<Duration> {
+    let secs = match attempts {
+        0 => 0,
+        1 => 60,
+        2 => 5 * 60,
+        3 => 15 * 60,
+        4 => 60 * 60,
+        5 => 6 * 60 * 60,
+        6 => 24 * 60 * 60,
+        _ => return None,
+    };
+    Some(Duration::from_secs(secs))
+}
+
+/// Should we federate this envelope to anywhere? Returns the list of
+/// remote target URLs (zero or more). The list excludes our own
+/// `public_url` so we never loop back. If the recipient has no remote
+/// `relay_endpoints` (or none other than us), the returned list is
+/// empty.
+///
+/// `relay_endpoints` order in the IdentityDocument is treated as
+/// preference: clients that publish multiple URLs are saying "try the
+/// first; the rest are fallbacks". v0 federation only enqueues the
+/// first non-self entry — multi-target failover is a follow-up.
+pub fn targets_for(
+    relay_endpoints: &[String],
+    self_public_url: Option<&str>,
+) -> Vec<String> {
+    let normalized_self = self_public_url.map(normalize_url);
+    let mut out = Vec::new();
+    for ep in relay_endpoints {
+        let ep_norm = normalize_url(ep);
+        if Some(&ep_norm) == normalized_self.as_ref() {
+            continue;
+        }
+        if !out.contains(&ep_norm) {
+            out.push(ep_norm);
+        }
+        // v0: only the first non-self endpoint. Future PRs can drop
+        // this `break` to enable multi-target delivery + failover.
+        break;
+    }
+    out
+}
+
+/// Lower-case + strip any trailing slash so trivial differences in how
+/// `relay_endpoints` are rendered (`HTTPS://...` vs `https://.../`) don't
+/// break self-detection.
+fn normalize_url(url: &str) -> String {
+    let s = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    s
+}
+
+/// Called from `routes::store_envelope` after a successful local store.
+/// Resolves the recipient's `IdentityDocument`, computes targets, and
+/// enqueues delivery rows. Errors are logged + swallowed — federation
+/// failures must not surface as `POST /v1/envelopes` failures (the
+/// envelope IS stored locally; the worker will keep retrying in the
+/// background).
+pub async fn maybe_enqueue(state: &AppState, envelope_id: &str, recipient_id: &str) {
+    let identity = match state.store.fetch_identity(recipient_id).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return, // unknown recipient: store-and-fetch model handles it
+        Err(e) => {
+            tracing::warn!(
+                target: "federation",
+                error = %e,
+                recipient_id,
+                "fetch_identity failed during enqueue; skipping"
+            );
+            return;
+        }
+    };
+
+    let targets = targets_for(&identity.relay_endpoints, state.public_url.as_deref());
+    if targets.is_empty() {
+        return;
+    }
+
+    for target in targets {
+        if let Err(e) = state
+            .store
+            .enqueue_outbound_delivery(envelope_id, &target)
+            .await
+        {
+            tracing::warn!(
+                target: "federation",
+                error = %e,
+                envelope_id,
+                target = %target,
+                "enqueue_outbound_delivery failed"
+            );
+        } else {
+            tracing::info!(
+                target: "federation",
+                envelope_id,
+                target = %target,
+                "enqueued"
+            );
+        }
+    }
+}
+
+/// Spawn the long-running delivery worker. Called once from `main` after
+/// `AppState` is built. Returns the JoinHandle so tests can drop it.
+pub fn spawn_delivery_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    let max_attempts = std::env::var("AEGIS_FEDERATION_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_ATTEMPTS);
+
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(format!(
+                "aegis-relay/{} federation",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(target: "federation", error = %e, "failed to build HTTP client; federation disabled");
+                return;
+            }
+        };
+
+        loop {
+            match state.store.next_pending_delivery().await {
+                Ok(Some(delivery)) => {
+                    deliver_one(&state, &client, max_attempts, &delivery).await;
+                    // Don't sleep on success — drain the queue greedily.
+                }
+                Ok(None) => {
+                    tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+                }
+                Err(e) => {
+                    tracing::error!(target: "federation", error = %e, "next_pending_delivery failed");
+                    tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+                }
+            }
+        }
+    })
+}
+
+/// Run one delivery attempt against the queue row in `delivery`. Public
+/// to the crate so tests can drive a single iteration without spinning
+/// up the long-running worker (avoids racing on the `IDLE_POLL_INTERVAL`
+/// sleep).
+pub(crate) async fn deliver_one(
+    state: &AppState,
+    client: &reqwest::Client,
+    max_attempts: u32,
+    delivery: &crate::storage::OutboundDelivery,
+) {
+    // Reload the envelope from local storage so we forward the EXACT
+    // bytes the sender pushed (signature canonicalization is byte-
+    // sensitive). If the envelope is gone (already delivered + expired,
+    // or admin purged) we skip and mark expired.
+    let envelope_json = match state
+        .store
+        .fetch_envelope_json(&delivery.envelope_id)
+        .await
+    {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            tracing::info!(
+                target: "federation",
+                envelope_id = %delivery.envelope_id,
+                target = %delivery.target_url,
+                "envelope no longer in local store; marking expired"
+            );
+            let _ = state
+                .store
+                .mark_delivery_expired(&delivery.envelope_id, &delivery.target_url)
+                .await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "federation",
+                error = %e,
+                envelope_id = %delivery.envelope_id,
+                "fetch_envelope_json failed during deliver; will retry"
+            );
+            schedule_retry(state, max_attempts, delivery, "envelope read failed").await;
+            return;
+        }
+    };
+
+    let body = json!({ "envelope": serde_json::from_str::<serde_json::Value>(&envelope_json).unwrap_or(serde_json::Value::Null) });
+
+    let url = format!("{}/v1/envelopes", delivery.target_url.trim_end_matches('/'));
+
+    let resp = client
+        .post(&url)
+        .header(FORWARDED_HEADER, "true")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(
+                target: "federation",
+                envelope_id = %delivery.envelope_id,
+                target = %delivery.target_url,
+                status = %r.status(),
+                "delivered"
+            );
+            state
+                .audit
+                .record(crate::audit::AuditEvent {
+                    at: Utc::now(),
+                    operation: "federation_delivered",
+                    outcome: "ok",
+                    recipient_id: None,
+                    envelope_id: Some(&delivery.envelope_id),
+                    identity_id: None,
+                    detail: Some(&delivery.target_url),
+                })
+                .await;
+            if let Err(e) = state
+                .store
+                .mark_delivery_delivered(&delivery.envelope_id, &delivery.target_url)
+                .await
+            {
+                tracing::error!(
+                    target: "federation",
+                    error = %e,
+                    envelope_id = %delivery.envelope_id,
+                    "mark_delivery_delivered failed"
+                );
+            }
+        }
+        Ok(r) if r.status().is_client_error() => {
+            // 4xx from peer: probably a permanent rejection (bad
+            // envelope, recipient unknown to peer). Don't retry.
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            tracing::warn!(
+                target: "federation",
+                envelope_id = %delivery.envelope_id,
+                target = %delivery.target_url,
+                status = %status,
+                body = %truncate(&body, 200),
+                "peer rejected with 4xx; expiring delivery"
+            );
+            state
+                .audit
+                .record(crate::audit::AuditEvent {
+                    at: Utc::now(),
+                    operation: "federation_expired",
+                    outcome: "rejected",
+                    recipient_id: None,
+                    envelope_id: Some(&delivery.envelope_id),
+                    identity_id: None,
+                    detail: Some(&format!(
+                        "{} status={} body={}",
+                        delivery.target_url,
+                        status,
+                        truncate(&body, 200)
+                    )),
+                })
+                .await;
+            let _ = state
+                .store
+                .mark_delivery_expired(&delivery.envelope_id, &delivery.target_url)
+                .await;
+        }
+        Ok(r) => {
+            // 5xx: transient — retry with backoff.
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            schedule_retry(
+                state,
+                max_attempts,
+                delivery,
+                &format!("HTTP {} {}", status, truncate(&body, 200)),
+            )
+            .await;
+        }
+        Err(e) => {
+            // Connection/TLS/timeout — retry.
+            schedule_retry(state, max_attempts, delivery, &format!("transport: {}", e)).await;
+        }
+    }
+}
+
+async fn schedule_retry(
+    state: &AppState,
+    max_attempts: u32,
+    delivery: &crate::storage::OutboundDelivery,
+    error: &str,
+) {
+    let next_attempt = delivery.attempts + 1;
+    let backoff = next_backoff(next_attempt);
+
+    let outcome = match backoff {
+        Some(_) if next_attempt >= max_attempts => "expired",
+        Some(_) => "retry",
+        None => "expired",
+    };
+
+    tracing::warn!(
+        target: "federation",
+        envelope_id = %delivery.envelope_id,
+        target = %delivery.target_url,
+        attempt = next_attempt,
+        error,
+        outcome,
+        "delivery attempt failed"
+    );
+
+    state
+        .audit
+        .record(crate::audit::AuditEvent {
+            at: Utc::now(),
+            operation: "federation_attempt",
+            outcome,
+            recipient_id: None,
+            envelope_id: Some(&delivery.envelope_id),
+            identity_id: None,
+            detail: Some(&format!(
+                "{} attempt={} error={}",
+                delivery.target_url,
+                next_attempt,
+                truncate(error, 200)
+            )),
+        })
+        .await;
+
+    if outcome == "expired" {
+        let _ = state
+            .store
+            .mark_delivery_expired(&delivery.envelope_id, &delivery.target_url)
+            .await;
+        return;
+    }
+
+    let next_at: DateTime<Utc> = Utc::now() + chrono::Duration::from_std(backoff.unwrap()).unwrap();
+    let _ = state
+        .store
+        .mark_delivery_attempt(&delivery.envelope_id, &delivery.target_url, error, next_at)
+        .await;
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use aegis_api_types::{StoreEnvelopeRequest, StoreEnvelopeResponse};
+    use aegis_proto::{
+        EncryptedBlob, Envelope, IdentityDocument, IdentityId, PublicKeyRecord, SuiteId,
+    };
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    use crate::audit::AuditSink;
+    use crate::config::RuntimeConfig;
+    use crate::storage::{Store, SqliteStore};
+    use crate::AppState;
+
+    /// One-shot mock that records every inbound `POST /v1/envelopes` —
+    /// enough to assert the federation worker forwards correctly.
+    #[derive(Default, Debug)]
+    struct RecordedRequest {
+        forwarded_header: Option<String>,
+        envelope_id: String,
+        recipient_id: String,
+    }
+
+    type Recorder = Arc<Mutex<Vec<RecordedRequest>>>;
+
+    async fn mock_remote_store(
+        State(rec): State<Recorder>,
+        headers: HeaderMap,
+        Json(req): Json<StoreEnvelopeRequest>,
+    ) -> Json<StoreEnvelopeResponse> {
+        let forwarded = headers
+            .get(FORWARDED_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        rec.lock().unwrap().push(RecordedRequest {
+            forwarded_header: forwarded,
+            envelope_id: req.envelope.envelope_id.0.to_string(),
+            recipient_id: req.envelope.recipient_id.0.clone(),
+        });
+        Json(StoreEnvelopeResponse {
+            accepted: true,
+            relay_id: "mock-remote".into(),
+        })
+    }
+
+    async fn spawn_mock_remote() -> (String, Recorder) {
+        let recorder: Recorder = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/envelopes", post(mock_remote_store))
+            .with_state(recorder.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), recorder)
+    }
+
+    fn sample_identity_doc(id: &str, relay_endpoints: Vec<String>) -> IdentityDocument {
+        IdentityDocument {
+            version: 1,
+            identity_id: IdentityId(id.to_string()),
+            aliases: vec![],
+            signing_keys: vec![PublicKeyRecord {
+                key_id: format!("{}-sign", id),
+                algorithm: "AMP-ED25519-V1".to_string(),
+                public_key_b64: "AAAA".to_string(),
+            }],
+            encryption_keys: vec![PublicKeyRecord {
+                key_id: format!("{}-x25519", id),
+                algorithm: "AMP-X25519-V1".to_string(),
+                public_key_b64: "BBBB".to_string(),
+            }],
+            supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".to_string()],
+            relay_endpoints,
+            signature: None,
+        }
+    }
+
+    fn sample_envelope_for(recipient: &str) -> Envelope {
+        Envelope::new(
+            IdentityId(recipient.to_string()),
+            None,
+            SuiteId::DemoXChaCha20Poly1305,
+            EncryptedBlob {
+                nonce_b64: "bm9uY2U=".to_string(),
+                ciphertext_b64: "Y2lwaGVydGV4dA==".to_string(),
+                eph_x25519_public_key_b64: None,
+                mlkem_ciphertext_b64: None,
+            },
+        )
+    }
+
+    async fn make_state(
+        public_url: Option<String>,
+        store: Arc<SqliteStore>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            store,
+            runtime: Arc::new(std::sync::RwLock::new(RuntimeConfig {
+                tokens: vec![],
+                require_token_for_push: false,
+                require_token_for_identity_put: false,
+                purge_acknowledged_on_cleanup: true,
+                max_message_age_days: None,
+            })),
+            admin_token: None,
+            audit: AuditSink::new(None),
+            runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
+            public_url,
+        })
+    }
+
+    // --- Pure-function tests --------------------------------------------
+
+    #[test]
+    fn backoff_schedule_matches_spec() {
+        assert_eq!(next_backoff(0), Some(Duration::from_secs(0)));
+        assert_eq!(next_backoff(1), Some(Duration::from_secs(60)));
+        assert_eq!(next_backoff(2), Some(Duration::from_secs(5 * 60)));
+        assert_eq!(next_backoff(3), Some(Duration::from_secs(15 * 60)));
+        assert_eq!(next_backoff(4), Some(Duration::from_secs(60 * 60)));
+        assert_eq!(next_backoff(5), Some(Duration::from_secs(6 * 60 * 60)));
+        assert_eq!(next_backoff(6), Some(Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(next_backoff(7), None);
+        assert_eq!(next_backoff(99), None);
+    }
+
+    #[test]
+    fn targets_skip_self_url() {
+        let endpoints = vec![
+            "https://relay.company-a.com/".to_string(),
+            "https://relay.company-b.com".to_string(),
+        ];
+        let targets = targets_for(&endpoints, Some("https://relay.company-a.com"));
+        assert_eq!(targets, vec!["https://relay.company-b.com".to_string()]);
+    }
+
+    #[test]
+    fn targets_take_first_non_self() {
+        // v0 takes only the first non-self entry.
+        let endpoints = vec![
+            "https://relay-1.example".to_string(),
+            "https://relay-2.example".to_string(),
+        ];
+        let targets = targets_for(&endpoints, None);
+        assert_eq!(targets, vec!["https://relay-1.example".to_string()]);
+    }
+
+    #[test]
+    fn targets_empty_when_only_self() {
+        let endpoints = vec!["https://us.example".to_string()];
+        let targets = targets_for(&endpoints, Some("https://us.example/"));
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn targets_empty_when_no_endpoints() {
+        let targets = targets_for(&[], Some("https://us.example"));
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn url_normalization_strips_trailing_slash_and_lowercases() {
+        let endpoints = vec!["HTTPS://Relay.Example.COM/".to_string()];
+        let targets = targets_for(&endpoints, Some("https://relay.example.com"));
+        assert!(
+            targets.is_empty(),
+            "self-loop should be detected after case-insensitive normalize, got {:?}",
+            targets
+        );
+    }
+
+    // --- End-to-end with a mock remote relay ----------------------------
+
+    #[tokio::test]
+    async fn maybe_enqueue_skips_when_recipient_only_lists_self() {
+        // This relay's own URL is the only entry on the recipient's
+        // identity doc — federation must be a no-op (we ARE the
+        // authoritative relay).
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zSelfRecipient";
+        store
+            .store_identity(&sample_identity_doc(
+                recipient,
+                vec!["https://us.example".to_string()],
+            ))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &env.envelope_id.0.to_string(), recipient).await;
+
+        let pending = store.next_pending_delivery().await.unwrap();
+        assert!(
+            pending.is_none(),
+            "no delivery should be queued when only target is self"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_enqueue_creates_row_for_remote_endpoint() {
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zRemoteRecipient";
+        store
+            .store_identity(&sample_identity_doc(
+                recipient,
+                vec!["https://peer.example".to_string()],
+            ))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        let pending = store.next_pending_delivery().await.unwrap().unwrap();
+        assert_eq!(pending.envelope_id, envelope_id);
+        assert_eq!(pending.target_url, "https://peer.example");
+        assert_eq!(pending.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn deliver_one_pushes_with_forwarded_header_and_purges_local() {
+        // End-to-end: real HTTP roundtrip from federation worker to a
+        // mock peer. Verifies the X-Aegis-Forwarded header is set, the
+        // peer receives the envelope, and the local copy is dropped on
+        // success ACK.
+        let (remote_url, recorder) = spawn_mock_remote().await;
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zFederationE2E";
+        store
+            .store_identity(&sample_identity_doc(recipient, vec![remote_url.clone()]))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        // Drive the worker by hand for one tick so we don't have to
+        // race against IDLE_POLL_INTERVAL.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+
+        // Mock peer received exactly one POST with the forwarded header.
+        let recv = recorder.lock().unwrap();
+        assert_eq!(recv.len(), 1, "expected one forwarded delivery");
+        assert_eq!(recv[0].envelope_id, envelope_id);
+        assert_eq!(recv[0].recipient_id, recipient);
+        assert_eq!(recv[0].forwarded_header.as_deref(), Some("true"));
+        drop(recv);
+
+        // Local envelope was expired on ACK.
+        let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(
+            local.is_none(),
+            "local envelope should be gone after delivery ACK"
+        );
+
+        // No more pending deliveries (status now 'delivered').
+        let after = store.next_pending_delivery().await.unwrap();
+        assert!(after.is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_one_retries_on_5xx_until_max_attempts() {
+        // Spin up a peer that always returns 503 — the worker should
+        // schedule retries until DEFAULT_MAX_ATTEMPTS, then mark expired.
+        let app = Router::new().route(
+            "/v1/envelopes",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "peer is down",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let remote_url = format!("http://{}", addr);
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zRetry";
+        store
+            .store_identity(&sample_identity_doc(recipient, vec![remote_url.clone()]))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // First attempt: 5xx → backoff scheduled, attempt count 1.
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+
+        // Row still exists, status still pending, but next_retry_at in
+        // the future so it's not "due".
+        let next = store.next_pending_delivery().await.unwrap();
+        assert!(
+            next.is_none(),
+            "5xx response should leave row pending but not due, got {:?}",
+            next
+        );
+
+        // Local envelope must NOT be deleted on a transient failure.
+        let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(local.is_some(), "envelope must persist across retries");
+    }
+
+    #[tokio::test]
+    async fn deliver_one_marks_expired_on_4xx_immediately() {
+        let app = Router::new().route(
+            "/v1/envelopes",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "{\"error\":{\"code\":\"invalid_envelope\"}}",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let remote_url = format!("http://{}", addr);
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zReject";
+        store
+            .store_identity(&sample_identity_doc(recipient, vec![remote_url.clone()]))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+
+        // 4xx: expired immediately, no further retries.
+        let next = store.next_pending_delivery().await.unwrap();
+        assert!(next.is_none(), "4xx should expire the row, not retry");
+
+        // Local envelope preserved (we only purge on successful ACK).
+        let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(local.is_some());
+    }
+}

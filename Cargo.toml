@@ -21,6 +21,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.5", features = ["cors"] }
 hickory-resolver = "0.24"
+# Phase 5 federation: relay-to-relay HTTPS push delivery (#28). rustls-tls
+# avoids the platform OpenSSL footprint (matters for the slim Docker images
+# in mlaify/aegis-deploy); `json` enables typed body decoding for
+# StoreEnvelopeRequest mirrors.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
