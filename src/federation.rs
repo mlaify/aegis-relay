@@ -38,6 +38,14 @@ pub const FORWARDED_HEADER: &str = "x-aegis-forwarded";
 /// operator to investigate.
 const DEFAULT_MAX_ATTEMPTS: u32 = 7;
 
+/// Default cap on how many `relay_endpoints` we'll fan out to for a single
+/// envelope. Configurable via `AEGIS_FEDERATION_MAX_TARGETS_PER_ENVELOPE`.
+/// A misconfigured `IdentityDocument` listing dozens of relays could
+/// otherwise DoS the queue with redundant deliveries; capping at 4 keeps
+/// the common-case "primary + 1-2 backups" working without trusting the
+/// recipient's count.
+const DEFAULT_MAX_TARGETS: usize = 4;
+
 /// How long to nap when the queue is empty. Short enough that newly-
 /// enqueued items get picked up quickly, long enough that we don't burn
 /// CPU on a busy-loop poll.
@@ -73,23 +81,27 @@ pub fn next_backoff(attempts: u32) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-/// Should we federate this envelope to anywhere? Returns the list of
-/// remote target URLs (zero or more). The list excludes our own
-/// `public_url` so we never loop back. If the recipient has no remote
-/// `relay_endpoints` (or none other than us), the returned list is
-/// empty.
+/// Resolve the list of remote relays to which this envelope should be
+/// federated. Returns up to `max_targets` URLs in the recipient's
+/// published preference order, with our own `public_url` filtered out
+/// (loop prevention) and duplicates collapsed.
 ///
-/// `relay_endpoints` order in the IdentityDocument is treated as
-/// preference: clients that publish multiple URLs are saying "try the
-/// first; the rest are fallbacks". v0 federation only enqueues the
-/// first non-self entry — multi-target failover is a follow-up.
+/// Multi-target failover (#30): when an `IdentityDocument` lists
+/// multiple `relay_endpoints`, we enqueue ONE outbound delivery per
+/// target. Each delivery row tracks its own attempt count + backoff;
+/// the FIRST one to succeed marks its siblings as `superseded` so
+/// they're not retried after the envelope has already landed somewhere.
 pub fn targets_for(
     relay_endpoints: &[String],
     self_public_url: Option<&str>,
+    max_targets: usize,
 ) -> Vec<String> {
     let normalized_self = self_public_url.map(normalize_url);
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for ep in relay_endpoints {
+        if out.len() >= max_targets {
+            break;
+        }
         let ep_norm = normalize_url(ep);
         if Some(&ep_norm) == normalized_self.as_ref() {
             continue;
@@ -97,11 +109,16 @@ pub fn targets_for(
         if !out.contains(&ep_norm) {
             out.push(ep_norm);
         }
-        // v0: only the first non-self endpoint. Future PRs can drop
-        // this `break` to enable multi-target delivery + failover.
-        break;
     }
     out
+}
+
+fn max_targets_per_envelope() -> usize {
+    std::env::var("AEGIS_FEDERATION_MAX_TARGETS_PER_ENVELOPE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_TARGETS)
 }
 
 /// Lower-case + strip any trailing slash so trivial differences in how
@@ -133,7 +150,11 @@ pub async fn maybe_enqueue(state: &AppState, envelope_id: &str, recipient_id: &s
         }
     };
 
-    let targets = targets_for(&identity.relay_endpoints, state.public_url.as_deref());
+    let targets = targets_for(
+        &identity.relay_endpoints,
+        state.public_url.as_deref(),
+        max_targets_per_envelope(),
+    );
     if targets.is_empty() {
         return;
     }
@@ -283,17 +304,50 @@ pub(crate) async fn deliver_one(
                     detail: Some(&delivery.target_url),
                 })
                 .await;
-            if let Err(e) = state
+            match state
                 .store
                 .mark_delivery_delivered(&delivery.envelope_id, &delivery.target_url)
                 .await
             {
-                tracing::error!(
-                    target: "federation",
-                    error = %e,
-                    envelope_id = %delivery.envelope_id,
-                    "mark_delivery_delivered failed"
-                );
+                Ok(superseded) => {
+                    // Multi-target failover (#30): siblings that were
+                    // still pending when this delivery succeeded are
+                    // now collapsed. Audit-log each one explicitly so
+                    // operators can grep for which target won and
+                    // which got skipped without re-running the SQL.
+                    for sibling in &superseded {
+                        tracing::info!(
+                            target: "federation",
+                            envelope_id = %delivery.envelope_id,
+                            superseded_target = %sibling,
+                            winner = %delivery.target_url,
+                            "sibling delivery superseded by successful peer"
+                        );
+                        state
+                            .audit
+                            .record(crate::audit::AuditEvent {
+                                at: Utc::now(),
+                                operation: "federation_superseded",
+                                outcome: "ok",
+                                recipient_id: None,
+                                envelope_id: Some(&delivery.envelope_id),
+                                identity_id: None,
+                                detail: Some(&format!(
+                                    "{} winner={}",
+                                    sibling, delivery.target_url
+                                )),
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "federation",
+                        error = %e,
+                        envelope_id = %delivery.envelope_id,
+                        "mark_delivery_delivered failed"
+                    );
+                }
             }
         }
         Ok(r) if r.status().is_client_error() => {
@@ -559,38 +613,84 @@ mod tests {
             "https://relay.company-a.com/".to_string(),
             "https://relay.company-b.com".to_string(),
         ];
-        let targets = targets_for(&endpoints, Some("https://relay.company-a.com"));
+        let targets =
+            targets_for(&endpoints, Some("https://relay.company-a.com"), DEFAULT_MAX_TARGETS);
         assert_eq!(targets, vec!["https://relay.company-b.com".to_string()]);
     }
 
     #[test]
-    fn targets_take_first_non_self() {
-        // v0 takes only the first non-self entry.
+    fn targets_returns_all_non_self_in_preference_order() {
+        // #30: federation now fans out to ALL non-self entries (up to
+        // max_targets), in published preference order.
         let endpoints = vec![
             "https://relay-1.example".to_string(),
             "https://relay-2.example".to_string(),
+            "https://relay-3.example".to_string(),
         ];
-        let targets = targets_for(&endpoints, None);
-        assert_eq!(targets, vec!["https://relay-1.example".to_string()]);
+        let targets = targets_for(&endpoints, None, DEFAULT_MAX_TARGETS);
+        assert_eq!(
+            targets,
+            vec![
+                "https://relay-1.example".to_string(),
+                "https://relay-2.example".to_string(),
+                "https://relay-3.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn targets_capped_at_max_targets() {
+        // Caller's max_targets caps the fanout — guards against a
+        // misconfigured doc with dozens of relay_endpoints.
+        let endpoints: Vec<String> = (0..10)
+            .map(|i| format!("https://relay-{}.example", i))
+            .collect();
+        let targets = targets_for(&endpoints, None, 3);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0], "https://relay-0.example");
+        assert_eq!(targets[2], "https://relay-2.example");
+    }
+
+    #[test]
+    fn targets_self_filter_does_not_count_against_cap() {
+        // The cap applies AFTER self-filter, so a doc with [self, A, B,
+        // C, D] returns [A, B, C, D] up to max — self isn't a "wasted"
+        // slot.
+        let endpoints = vec![
+            "https://us.example".to_string(),
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+            "https://c.example".to_string(),
+        ];
+        let targets = targets_for(&endpoints, Some("https://us.example"), 3);
+        assert_eq!(
+            targets,
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string(),
+                "https://c.example".to_string(),
+            ]
+        );
     }
 
     #[test]
     fn targets_empty_when_only_self() {
         let endpoints = vec!["https://us.example".to_string()];
-        let targets = targets_for(&endpoints, Some("https://us.example/"));
+        let targets = targets_for(&endpoints, Some("https://us.example/"), DEFAULT_MAX_TARGETS);
         assert!(targets.is_empty());
     }
 
     #[test]
     fn targets_empty_when_no_endpoints() {
-        let targets = targets_for(&[], Some("https://us.example"));
+        let targets = targets_for(&[], Some("https://us.example"), DEFAULT_MAX_TARGETS);
         assert!(targets.is_empty());
     }
 
     #[test]
     fn url_normalization_strips_trailing_slash_and_lowercases() {
         let endpoints = vec!["HTTPS://Relay.Example.COM/".to_string()];
-        let targets = targets_for(&endpoints, Some("https://relay.example.com"));
+        let targets =
+            targets_for(&endpoints, Some("https://relay.example.com"), DEFAULT_MAX_TARGETS);
         assert!(
             targets.is_empty(),
             "self-loop should be detected after case-insensitive normalize, got {:?}",
@@ -649,6 +749,217 @@ mod tests {
         assert_eq!(pending.envelope_id, envelope_id);
         assert_eq!(pending.target_url, "https://peer.example");
         assert_eq!(pending.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_enqueue_creates_row_per_remote_endpoint() {
+        // #30: with multiple relay_endpoints, each gets its own row.
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zMultiTarget";
+        store
+            .store_identity(&sample_identity_doc(
+                recipient,
+                vec![
+                    "https://peer-1.example".to_string(),
+                    "https://peer-2.example".to_string(),
+                    "https://peer-3.example".to_string(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        // Drain the queue; should produce three pending rows (one per
+        // target). Order is by next_retry_at which is identical at
+        // enqueue time → use a set to compare.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let row = store
+                .next_pending_delivery()
+                .await
+                .unwrap()
+                .expect("pending row");
+            seen.insert(row.target_url.clone());
+            // Push each retrieved row out of the way by scheduling its
+            // next attempt in the future, so the next loop iteration
+            // returns a different row.
+            store
+                .mark_delivery_attempt(
+                    &row.envelope_id,
+                    &row.target_url,
+                    "test-skip",
+                    Utc::now() + chrono::Duration::hours(1),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            seen,
+            ["https://peer-1.example", "https://peer-2.example", "https://peer-3.example"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_successful_delivery_supersedes_pending_siblings() {
+        // The headline #30 behavior: when one target succeeds, the
+        // others stop being attempted. Set up three pending rows for
+        // the same envelope, then mark one delivered and verify the
+        // others flip to 'superseded'.
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let env = sample_envelope_for("amp:did:key:zSibSupRecipient");
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        for target in [
+            "https://peer-1.example",
+            "https://peer-2.example",
+            "https://peer-3.example",
+        ] {
+            store
+                .enqueue_outbound_delivery(&envelope_id, target)
+                .await
+                .unwrap();
+        }
+
+        // Mark the middle one delivered.
+        let superseded = store
+            .mark_delivery_delivered(&envelope_id, "https://peer-2.example")
+            .await
+            .unwrap();
+
+        let mut sup_set: std::collections::HashSet<String> = superseded.into_iter().collect();
+        assert!(sup_set.remove("https://peer-1.example"));
+        assert!(sup_set.remove("https://peer-3.example"));
+        assert!(sup_set.is_empty(), "extra siblings reported: {:?}", sup_set);
+
+        // Nothing pending — the other two are 'superseded', not
+        // 'pending' — so the worker won't pick them up again.
+        let next = store.next_pending_delivery().await.unwrap();
+        assert!(next.is_none(), "no rows should be pending, got {:?}", next);
+
+        // Local envelope is purged.
+        let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(local.is_none());
+    }
+
+    #[tokio::test]
+    async fn delivery_failures_dont_supersede_other_targets() {
+        // Counterpoint: marking ONE delivery expired (failure) does
+        // NOT affect the others. They keep retrying independently.
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let env = sample_envelope_for("amp:did:key:zIndependentFailures");
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        for target in ["https://peer-1.example", "https://peer-2.example"] {
+            store
+                .enqueue_outbound_delivery(&envelope_id, target)
+                .await
+                .unwrap();
+        }
+
+        store
+            .mark_delivery_expired(&envelope_id, "https://peer-1.example")
+            .await
+            .unwrap();
+
+        // peer-2 must still be available for the worker to pick up.
+        let next = store
+            .next_pending_delivery()
+            .await
+            .unwrap()
+            .expect("peer-2 still pending");
+        assert_eq!(next.target_url, "https://peer-2.example");
+
+        // Local envelope must NOT be purged on a single-target
+        // expiration (only on success).
+        let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(local.is_some());
+    }
+
+    #[tokio::test]
+    async fn multi_target_e2e_first_success_wins_others_superseded() {
+        // End-to-end: three peers, two return 503, one returns 200.
+        // Verifies the integrated behavior — worker drains the queue,
+        // hits the failures (which schedule retries), and when the
+        // succeeding peer ACKs the failed siblings flip to superseded.
+        let (good_url, good_recorder) = spawn_mock_remote().await;
+
+        // Two "down" peers that always 503.
+        async fn always_503() -> (axum::http::StatusCode, &'static str) {
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down")
+        }
+        let down_a = Router::new().route("/v1/envelopes", post(always_503));
+        let down_b = Router::new().route("/v1/envelopes", post(always_503));
+        let l_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = l_a.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(l_a, down_a).await;
+        });
+        let l_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = l_b.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(l_b, down_b).await;
+        });
+        let down_a_url = format!("http://{}", a_addr);
+        let down_b_url = format!("http://{}", b_addr);
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zMultiE2E";
+        // Order matters — published preference order. Working peer is
+        // last so we exercise the failures-before-success path.
+        store
+            .store_identity(&sample_identity_doc(
+                recipient,
+                vec![down_a_url.clone(), down_b_url.clone(), good_url.clone()],
+            ))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // Drain everything that's "due now" from the queue. The
+        // worker normally loops forever; we simulate one drain pass
+        // here. Order matches whatever next_pending_delivery picks
+        // first — irrelevant because every pending row is due.
+        for _ in 0..3 {
+            let Some(due) = store.next_pending_delivery().await.unwrap() else {
+                break;
+            };
+            deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+        }
+
+        // The good peer received exactly one POST (the winning one).
+        let recv = good_recorder.lock().unwrap();
+        assert_eq!(recv.len(), 1, "good peer should receive exactly one POST");
+        assert_eq!(recv[0].forwarded_header.as_deref(), Some("true"));
+        drop(recv);
+
+        // Local envelope is gone.
+        let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(local.is_none(), "envelope should be purged on first ACK");
+
+        // No more pending deliveries — failed siblings either retried
+        // (but pushed to future) and superseded by the winner.
+        let nothing = store.next_pending_delivery().await.unwrap();
+        assert!(nothing.is_none());
     }
 
     #[tokio::test]
