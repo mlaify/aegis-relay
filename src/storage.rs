@@ -92,6 +92,19 @@ pub enum ProvisionOutcome {
     DomainNotServed,
 }
 
+/// Outcome of `deprovision_user`. Both fields are surfaced through the
+/// admin API + audit log so operators can see what got cleaned up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeprovisionOutcome {
+    /// True if a `provisioned_users` row matched and was removed. False
+    /// means the alias was never provisioned (HTTP 404 on the admin API).
+    pub alias_removed: bool,
+    /// Number of envelopes purged from the queue. Zero when the alias was
+    /// never bound to an identity, or when no envelopes were addressed to
+    /// the bound identity.
+    pub envelopes_purged: u64,
+}
+
 /// Outcome of `claim_provisioned_alias` — used during identity PUT to enforce
 /// that an alias reserved for one identity_id cannot be hijacked by another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,9 +203,20 @@ pub trait Store: Send + Sync {
 
     // -- Served domains -------------------------------------------------------
 
+    /// Paginated list of claimed domains ordered by `added_at ASC` (oldest
+    /// first; matches the original unsorted-feel of pre-paginated callers).
     async fn list_served_domains(
         &self,
+        offset: usize,
+        limit: usize,
     ) -> Result<Vec<DomainEntry>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Total count of claimed domains. Pairs with `list_served_domains` so
+    /// the admin API can return total alongside the paginated slice without
+    /// forcing every caller to compute it from a full scan.
+    async fn count_served_domains(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Add a domain claim with a freshly-generated verification token.
     /// Returns the existing entry if the domain is already claimed (idempotent).
@@ -243,12 +267,23 @@ pub trait Store: Send + Sync {
         alias: &str,
     ) -> Result<ProvisionOutcome, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Remove a provisioned-user reservation (and the alias index row).
-    /// Returns `false` if the alias was not provisioned.
+    /// Remove a provisioned-user reservation, drop the alias index row, AND
+    /// purge envelopes addressed to the bound identity. Returns the
+    /// `(alias_removed, envelopes_purged)` pair so the admin API can surface
+    /// the count in the response and the audit log.
+    ///
+    /// Why purge envelopes: the Phase 1 spec calls for deprovision to "revoke
+    /// alias, purge envelopes" (see RFC-0004 §user-provisioning). Envelopes
+    /// are keyed by `recipient_id` (identity_id), not by alias, so we look up
+    /// the bound identity_id from `identity_aliases` before deleting the
+    /// alias row, then drop every envelope addressed to that identity.
+    ///
+    /// If the alias has no bound identity (status='provisioned' but never
+    /// claimed), `envelopes_purged` is 0 — there's nothing tied to it yet.
     async fn deprovision_user(
         &self,
         alias: &str,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<DeprovisionOutcome, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Check whether an alias is provisioned and to whom. Used at identity
     /// PUT time to gate alias binding.
@@ -573,8 +608,17 @@ impl Store for FileStore {
 
     async fn list_served_domains(
         &self,
+        _offset: usize,
+        _limit: usize,
     ) -> Result<Vec<DomainEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        // FileStore is a dev scaffold — domains aren't persisted here.
         Ok(vec![])
+    }
+
+    async fn count_served_domains(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(0)
     }
 
     async fn add_served_domain(
@@ -636,8 +680,11 @@ impl Store for FileStore {
     async fn deprovision_user(
         &self,
         _alias: &str,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(false)
+    ) -> Result<DeprovisionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(DeprovisionOutcome {
+            alias_removed: false,
+            envelopes_purged: 0,
+        })
     }
 
     async fn claim_provisioned_alias(
@@ -1218,17 +1265,22 @@ impl Store for SqliteStore {
 
     async fn list_served_domains(
         &self,
+        offset: usize,
+        limit: usize,
     ) -> Result<Vec<DomainEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let offset_i64 = offset as i64;
+        let limit_i64 = limit as i64;
         let rows = self
             .conn
-            .call(|conn| {
+            .call(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT domain, verification_token, verified_at, added_at \
                      FROM served_domains \
-                     ORDER BY added_at ASC",
+                     ORDER BY added_at ASC \
+                     LIMIT ?1 OFFSET ?2",
                 )?;
                 let rows = stmt
-                    .query_map([], |row| {
+                    .query_map(rusqlite::params![limit_i64, offset_i64], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
@@ -1249,6 +1301,19 @@ impl Store for SqliteStore {
                 added_at,
             })
             .collect())
+    }
+
+    async fn count_served_domains(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let n: i64 = self
+            .conn
+            .call(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM served_domains", [], |row| row.get(0))
+                    .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(n.max(0) as usize)
     }
 
     async fn add_served_domain(
@@ -1515,13 +1580,35 @@ impl Store for SqliteStore {
     async fn deprovision_user(
         &self,
         alias: &str,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DeprovisionOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let alias_owned = alias.to_string();
-        let removed = self
+        // One transaction so the alias deletion and envelope purge are
+        // atomic — partial failure can't leave a stale alias pointing at
+        // an empty inbox or vice-versa.
+        let outcome = self
             .conn
             .call(move |conn| {
                 let tx = conn.unchecked_transaction()?;
-                let n = tx.execute(
+
+                // Look up the bound identity_id BEFORE deleting any rows.
+                // We read from `provisioned_users` because that is the
+                // canonical source-of-truth in managed mode: when an
+                // identity claims a provisioned alias, `claim_provisioned_alias`
+                // writes `identity_id` here. The mirror row in
+                // `identity_aliases` may or may not exist (it lives on
+                // the identity PUT path); `provisioned_users` is always
+                // current. A `Some(None)` result means the alias was
+                // provisioned but never claimed — nothing to purge.
+                let identity_id: Option<String> = tx
+                    .query_row(
+                        "SELECT identity_id FROM provisioned_users WHERE alias = ?1",
+                        rusqlite::params![alias_owned],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+
+                let alias_removed_count = tx.execute(
                     "DELETE FROM provisioned_users WHERE alias = ?1",
                     rusqlite::params![alias_owned],
                 )?;
@@ -1529,11 +1616,29 @@ impl Store for SqliteStore {
                     "DELETE FROM identity_aliases WHERE alias = ?1",
                     rusqlite::params![alias_owned],
                 )?;
+
+                // Only purge envelopes when the alias was bound to an
+                // identity. Envelopes are addressed by `recipient_id` —
+                // the underlying identity_id — so the alias-to-identity
+                // mapping is the bridge between "deprovision user@domain"
+                // and "drop their inbox queue".
+                let envelopes_purged = if let Some(ref id) = identity_id {
+                    tx.execute(
+                        "DELETE FROM envelopes WHERE recipient_id = ?1",
+                        rusqlite::params![id],
+                    )? as u64
+                } else {
+                    0u64
+                };
+
                 tx.commit()?;
-                Ok(n)
+                Ok((alias_removed_count > 0, envelopes_purged))
             })
             .await?;
-        Ok(removed > 0)
+        Ok(DeprovisionOutcome {
+            alias_removed: outcome.0,
+            envelopes_purged: outcome.1,
+        })
     }
 
     async fn claim_provisioned_alias(
@@ -2459,6 +2564,141 @@ mod tests {
             .await
             .unwrap();
         assert!(users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deprovision_user_purges_envelopes_for_bound_identity() {
+        // Captures aegis-relay#24 — DELETE /admin/users/:alias should drop
+        // the alias entry AND every envelope addressed to the bound
+        // identity. Envelopes are keyed by `recipient_id` (identity_id),
+        // so the bridge from "deprovision user@domain" → "drain inbox"
+        // is the alias row.
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        store
+            .add_served_domain("example.com", "tok-1")
+            .await
+            .unwrap();
+        store.mark_domain_verified("example.com").await.unwrap();
+        store.provision_user("alice@example.com").await.unwrap();
+
+        let identity_id = "amp:did:key:zAliceDeprovisionTest";
+        let bound = store
+            .claim_provisioned_alias("alice@example.com", identity_id)
+            .await
+            .unwrap();
+        assert_eq!(bound, ClaimAliasOutcome::Bound);
+
+        // Insert two envelopes for this identity and one for an unrelated
+        // identity — the unrelated envelope must NOT be purged.
+        for _ in 0..2 {
+            store.store(&sample_envelope(identity_id)).await.unwrap();
+        }
+        let other_identity = "amp:did:key:zBobUntouched";
+        store
+            .store(&sample_envelope(other_identity))
+            .await
+            .unwrap();
+
+        let outcome = store.deprovision_user("alice@example.com").await.unwrap();
+        assert!(outcome.alias_removed);
+        assert_eq!(outcome.envelopes_purged, 2);
+
+        // Bob's envelope is still there; Alice's queue is empty.
+        let alice_remaining = store.fetch(identity_id).await.unwrap();
+        assert!(alice_remaining.is_empty());
+        let bob_remaining = store
+            .fetch(other_identity)
+            .await
+            .unwrap();
+        assert_eq!(bob_remaining.len(), 1);
+
+        // The provisioned-user roster row is gone too.
+        let users = store
+            .list_provisioned_users(Some("example.com"), 0, 10)
+            .await
+            .unwrap();
+        assert!(users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deprovision_user_without_bound_identity_purges_zero() {
+        // When an alias is provisioned but never claimed by an identity,
+        // there's nothing in the queue addressed to it — `envelopes_purged`
+        // must be exactly 0 (no false-positive wildcard purge).
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        store
+            .add_served_domain("example.com", "tok-2")
+            .await
+            .unwrap();
+        store.mark_domain_verified("example.com").await.unwrap();
+        store.provision_user("ghost@example.com").await.unwrap();
+
+        // An envelope addressed to a totally unrelated identity should
+        // not be touched.
+        let other = "amp:did:key:zSomeoneElse";
+        store.store(&sample_envelope(other)).await.unwrap();
+
+        let outcome = store.deprovision_user("ghost@example.com").await.unwrap();
+        assert!(outcome.alias_removed);
+        assert_eq!(outcome.envelopes_purged, 0);
+
+        let other_remaining = store.fetch(other).await.unwrap();
+        assert_eq!(other_remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deprovision_user_returns_false_when_alias_not_provisioned() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        let outcome = store.deprovision_user("nobody@example.com").await.unwrap();
+        assert!(!outcome.alias_removed);
+        assert_eq!(outcome.envelopes_purged, 0);
+    }
+
+    #[tokio::test]
+    async fn list_served_domains_paginates_consistently() {
+        // Pagination on `GET /admin/domains` is the second half of the
+        // change in #24's PR — make sure the slice + count are
+        // consistent across pages.
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        for i in 0..5 {
+            store
+                .add_served_domain(&format!("d{}.example.com", i), &format!("tok-{}", i))
+                .await
+                .unwrap();
+        }
+
+        let total = store.count_served_domains().await.unwrap();
+        assert_eq!(total, 5);
+
+        let page1 = store.list_served_domains(0, 2).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        let page2 = store.list_served_domains(2, 2).await.unwrap();
+        assert_eq!(page2.len(), 2);
+        let page3 = store.list_served_domains(4, 2).await.unwrap();
+        assert_eq!(page3.len(), 1);
+
+        // Pages are ordered by added_at ASC; combined they should equal
+        // the 5 domains we inserted, in insertion order.
+        let combined: Vec<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|e| e.domain.clone())
+            .collect();
+        assert_eq!(
+            combined,
+            vec![
+                "d0.example.com",
+                "d1.example.com",
+                "d2.example.com",
+                "d3.example.com",
+                "d4.example.com",
+            ]
+        );
+
+        // Out-of-range offsets yield empty pages, not errors.
+        let page_oob = store.list_served_domains(99, 10).await.unwrap();
+        assert!(page_oob.is_empty());
     }
 
     #[tokio::test]

@@ -41,7 +41,10 @@ pub async fn well_known_aegis_config(
     State(state): State<Arc<AppState>>,
     Host(host_header): Host,
 ) -> Response {
-    let domains = match state.store.list_served_domains().await {
+    // Pull a generous slice to support orgs with many claimed domains;
+    // discovery iterates over all verified entries and the cap mirrors
+    // the admin API's per-page ceiling.
+    let domains = match state.store.list_served_domains(0, 200).await {
         Ok(v) => v,
         Err(_) => {
             return (

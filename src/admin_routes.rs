@@ -494,7 +494,20 @@ pub struct DomainListItem {
 
 #[derive(Debug, Serialize)]
 pub struct DomainListResponse {
+    pub offset: usize,
+    pub limit: usize,
+    /// Total number of domains claimed (across all pages). Lets callers
+    /// render a "showing N of M" summary without a second round-trip.
+    pub total: usize,
     pub items: Vec<DomainListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DomainListParams {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,12 +551,29 @@ fn normalize_domain(input: &str) -> Option<String> {
 pub async fn admin_list_domains(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<DomainListParams>,
 ) -> Response {
     if let Err(e) = require_admin_auth(&state, &headers) {
         return e;
     }
-    match state.store.list_served_domains().await {
+    // Cap the per-page limit so a malicious or buggy client can't pull
+    // every domain in one shot. Mirrors the cap on `admin_list_users`.
+    let limit = params.limit.min(200);
+    let total = match state.store.count_served_domains().await {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": { "code": "storage_error", "message": "count domains failed" } })),
+            )
+                .into_response()
+        }
+    };
+    match state.store.list_served_domains(params.offset, limit).await {
         Ok(entries) => Json(DomainListResponse {
+            offset: params.offset,
+            limit,
+            total,
             items: entries.into_iter().map(domain_entry_to_item).collect(),
         })
         .into_response(),
@@ -788,6 +818,15 @@ pub struct ProvisionUserRequest {
     pub alias: String,
 }
 
+/// Body of `DELETE /admin/users/:alias`. Returned with HTTP 200 (not 204)
+/// so callers can read the count — flipping from "204 No Content" is the
+/// breaking change tracked in #24, but no production deployments yet.
+#[derive(Debug, Serialize)]
+pub struct DeprovisionUserResponse {
+    pub alias: String,
+    pub envelopes_purged: u64,
+}
+
 pub async fn admin_list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -899,7 +938,7 @@ pub async fn admin_deprovision_user(
     }
     let alias = alias.trim().to_ascii_lowercase();
     match state.store.deprovision_user(&alias).await {
-        Ok(true) => {
+        Ok(outcome) if outcome.alias_removed => {
             state
                 .audit
                 .record(AuditEvent {
@@ -909,12 +948,19 @@ pub async fn admin_deprovision_user(
                     recipient_id: None,
                     envelope_id: None,
                     identity_id: None,
-                    detail: Some(&format!("alias={}", alias)),
+                    detail: Some(&format!(
+                        "alias={} envelopes_purged={}",
+                        alias, outcome.envelopes_purged
+                    )),
                 })
                 .await;
-            StatusCode::NO_CONTENT.into_response()
+            Json(DeprovisionUserResponse {
+                alias,
+                envelopes_purged: outcome.envelopes_purged,
+            })
+            .into_response()
         }
-        Ok(false) => (
+        Ok(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": { "code": "not_found", "message": "alias not provisioned" } })),
         )
