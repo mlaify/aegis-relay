@@ -2,6 +2,7 @@ mod admin_routes;
 mod audit;
 mod config;
 mod discovery;
+mod federation;
 mod identity_routes;
 mod prekey_routes;
 mod routes;
@@ -51,6 +52,19 @@ async fn main() {
         runtime_config_path,
         public_url,
     });
+
+    // Phase 5 (#28): start the federation delivery worker. Off by default
+    // when no public_url is configured — without one the worker can't
+    // tell "us" from "them" and could loop. When public_url IS set, the
+    // worker drains `outbound_deliveries` continuously in the background.
+    if state.public_url.is_some() {
+        let _handle = federation::spawn_delivery_worker(state.clone());
+        tracing::info!("federation delivery worker started");
+    } else {
+        tracing::info!(
+            "AEGIS_RELAY_PUBLIC_URL is unset; federation disabled (set it to enable push delivery)"
+        );
+    }
 
     let app = Router::new()
         .route(

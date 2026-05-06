@@ -105,6 +105,24 @@ pub struct DeprovisionOutcome {
     pub envelopes_purged: u64,
 }
 
+/// One row from the federation outbound-delivery queue. The queue is the
+/// bridge between "this relay stored an envelope" and "the recipient's
+/// authoritative relay accepts it" (mlaify/aegis-relay#28).
+#[derive(Debug, Clone)]
+pub struct OutboundDelivery {
+    pub envelope_id: String,
+    pub target_url: String,
+    pub status: String, // "pending" | "delivered" | "expired"
+    pub attempts: u32,
+    /// Earliest time at which a `status='pending'` row should be retried.
+    /// In the past for "due now", in the future for "backed off". Stored as
+    /// RFC-3339; ordering is lexicographic UTC-safe.
+    pub next_retry_at: String,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub created_at: String,
+}
+
 /// Outcome of `claim_provisioned_alias` — used during identity PUT to enforce
 /// that an alias reserved for one identity_id cannot be hijacked by another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +310,72 @@ pub trait Store: Send + Sync {
         alias: &str,
         identity_id: &str,
     ) -> Result<ClaimAliasOutcome, Box<dyn std::error::Error + Send + Sync>>;
+
+    // -- Outbound federation queue (#28) --------------------------------------
+    //
+    // When this relay stores an envelope addressed to a recipient whose
+    // IdentityDocument lists a *different* relay's URL in `relay_endpoints`,
+    // the federation worker pushes the envelope to that relay over HTTPS.
+    // The queue persists across restarts so deliveries survive crashes /
+    // remote-relay outages, with exponential backoff up to a configurable
+    // attempt cap.
+
+    /// Fetch a single envelope's raw JSON by id, regardless of recipient
+    /// or acknowledged state. Used by the federation worker to forward
+    /// the exact bytes the sender produced (signature canonicalization
+    /// is byte-sensitive — round-tripping through `Envelope` would
+    /// preserve semantics but might shuffle field order).
+    async fn fetch_envelope_json(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Enqueue a delivery row. Idempotent on `(envelope_id, target_url)` —
+    /// duplicates are silently ignored so callers don't have to dedupe at
+    /// the route layer (e.g. a retried `POST /v1/envelopes` shouldn't double-
+    /// enqueue).
+    async fn enqueue_outbound_delivery(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Pull the oldest `status='pending'` row whose `next_retry_at <= now`.
+    /// Returns `None` when nothing is due — the federation worker uses this
+    /// as its sleep signal.
+    async fn next_pending_delivery(
+        &self,
+    ) -> Result<Option<OutboundDelivery>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Record a failed attempt. Increments `attempts`, sets `last_error` and
+    /// `last_attempt_at`, and pushes `next_retry_at` to whatever the
+    /// federation worker computed via its backoff schedule.
+    async fn mark_delivery_attempt(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+        error: &str,
+        next_retry_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Mark a delivery as `delivered` AND drop the local envelope copy.
+    /// The envelope-deletion is part of the same SQL transaction so we
+    /// can't end up with a row claiming "delivered" while the envelope
+    /// still sits in the queue for the recipient to fetch locally.
+    async fn mark_delivery_delivered(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Mark a delivery as `expired` (max attempts exhausted). The local
+    /// envelope copy is preserved — the operator may still want to retry
+    /// manually or a subsequent gateway path may pick it up.
+    async fn mark_delivery_expired(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +778,55 @@ impl Store for FileStore {
     ) -> Result<ClaimAliasOutcome, Box<dyn std::error::Error + Send + Sync>> {
         Ok(ClaimAliasOutcome::NotProvisioned)
     }
+
+    // FileStore is a dev scaffold and does not implement federation.
+
+    async fn fetch_envelope_json(
+        &self,
+        _envelope_id: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn enqueue_outbound_delivery(
+        &self,
+        _envelope_id: &str,
+        _target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn next_pending_delivery(
+        &self,
+    ) -> Result<Option<OutboundDelivery>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn mark_delivery_attempt(
+        &self,
+        _envelope_id: &str,
+        _target_url: &str,
+        _error: &str,
+        _next_retry_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn mark_delivery_delivered(
+        &self,
+        _envelope_id: &str,
+        _target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn mark_delivery_expired(
+        &self,
+        _envelope_id: &str,
+        _target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +891,25 @@ const MIGRATIONS: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_provisioned_users_identity_id
         ON provisioned_users(identity_id);
+
+    -- Phase 5 federation queue (mlaify/aegis-relay#28). One row per
+    -- (envelope, target relay) pair. Status flows pending → delivered |
+    -- expired. The composite PK keeps `enqueue_outbound_delivery`
+    -- idempotent without a separate UNIQUE constraint.
+    CREATE TABLE IF NOT EXISTS outbound_deliveries (
+        envelope_id TEXT NOT NULL,
+        target_url TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at TEXT NOT NULL,
+        last_error TEXT,
+        last_attempt_at TEXT,
+        created_at TEXT NOT NULL,
+        delivered_at TEXT,
+        PRIMARY KEY (envelope_id, target_url)
+    );
+    CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_due
+        ON outbound_deliveries(status, next_retry_at);
 ";
 
 pub struct SqliteStore {
@@ -1681,6 +1833,184 @@ impl Store for SqliteStore {
             })
             .await?;
         Ok(outcome)
+    }
+
+    // -- Outbound federation queue (#28) -------------------------------------
+
+    async fn fetch_envelope_json(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT envelope_json FROM envelopes WHERE envelope_id = ?1",
+                    rusqlite::params![envelope_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(row)
+    }
+
+    async fn enqueue_outbound_delivery(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let target_url = target_url.to_string();
+        let now = Utc::now().to_rfc3339();
+        // INSERT OR IGNORE on the composite PK gives us idempotent
+        // enqueueing — if (envelope, target) is already in the queue we
+        // leave the existing row alone (which preserves attempt count
+        // and current backoff state). Federation worker will pick it up
+        // again next tick if it's pending.
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO outbound_deliveries \
+                     (envelope_id, target_url, status, attempts, next_retry_at, created_at) \
+                     VALUES (?1, ?2, 'pending', 0, ?3, ?3)",
+                    rusqlite::params![envelope_id, target_url, now],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn next_pending_delivery(
+        &self,
+    ) -> Result<Option<OutboundDelivery>, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Utc::now().to_rfc3339();
+        let row = self
+            .conn
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT envelope_id, target_url, status, attempts, next_retry_at, \
+                            last_error, last_attempt_at, created_at \
+                     FROM outbound_deliveries \
+                     WHERE status = 'pending' AND next_retry_at <= ?1 \
+                     ORDER BY next_retry_at ASC \
+                     LIMIT 1",
+                    rusqlite::params![now],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, String>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(row.map(|t| OutboundDelivery {
+            envelope_id: t.0,
+            target_url: t.1,
+            status: t.2,
+            attempts: t.3.max(0) as u32,
+            next_retry_at: t.4,
+            last_error: t.5,
+            last_attempt_at: t.6,
+            created_at: t.7,
+        }))
+    }
+
+    async fn mark_delivery_attempt(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+        error: &str,
+        next_retry_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let target_url = target_url.to_string();
+        let error = error.to_string();
+        let next = next_retry_at.to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE outbound_deliveries \
+                     SET attempts = attempts + 1, \
+                         last_error = ?1, \
+                         last_attempt_at = ?2, \
+                         next_retry_at = ?3 \
+                     WHERE envelope_id = ?4 AND target_url = ?5 AND status = 'pending'",
+                    rusqlite::params![error, now, next, envelope_id, target_url],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_delivery_delivered(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let target_url = target_url.to_string();
+        let now = Utc::now().to_rfc3339();
+        // Atomic: flip the row to 'delivered' AND drop the local envelope
+        // copy. The spec calls for "expire local copy" on ACK so the
+        // envelope doesn't sit around forever in this relay's queue
+        // duplicating what the recipient's authoritative relay now holds.
+        self.conn
+            .call(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "UPDATE outbound_deliveries \
+                     SET status = 'delivered', \
+                         delivered_at = ?1, \
+                         last_attempt_at = ?1 \
+                     WHERE envelope_id = ?2 AND target_url = ?3",
+                    rusqlite::params![now, envelope_id, target_url],
+                )?;
+                tx.execute(
+                    "DELETE FROM envelopes WHERE envelope_id = ?1",
+                    rusqlite::params![envelope_id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_delivery_expired(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let target_url = target_url.to_string();
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE outbound_deliveries \
+                     SET status = 'expired', last_attempt_at = ?1 \
+                     WHERE envelope_id = ?2 AND target_url = ?3",
+                    rusqlite::params![now, envelope_id, target_url],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -2699,6 +3029,121 @@ mod tests {
         // Out-of-range offsets yield empty pages, not errors.
         let page_oob = store.list_served_domains(99, 10).await.unwrap();
         assert!(page_oob.is_empty());
+    }
+
+    // Federation queue (#28) ---------------------------------------------
+
+    #[tokio::test]
+    async fn outbound_delivery_round_trip() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        // Stash a real envelope so mark_delivery_delivered can drop it.
+        let env = sample_envelope("amp:did:key:zRecipient");
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        // First enqueue is a real INSERT.
+        store
+            .enqueue_outbound_delivery(&envelope_id, "https://peer.example/v1/envelopes")
+            .await
+            .unwrap();
+
+        // Idempotent: double-enqueueing the same (envelope, target) is a
+        // no-op so retried POSTs from the originating sender don't double
+        // up the queue.
+        store
+            .enqueue_outbound_delivery(&envelope_id, "https://peer.example/v1/envelopes")
+            .await
+            .unwrap();
+
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        assert_eq!(due.envelope_id, envelope_id);
+        assert_eq!(due.target_url, "https://peer.example/v1/envelopes");
+        assert_eq!(due.status, "pending");
+        assert_eq!(due.attempts, 0);
+
+        // Mark delivered: status → 'delivered' AND envelope is purged.
+        store
+            .mark_delivery_delivered(&envelope_id, "https://peer.example/v1/envelopes")
+            .await
+            .unwrap();
+
+        // No longer pending.
+        let after = store.next_pending_delivery().await.unwrap();
+        assert!(after.is_none());
+
+        // Envelope itself is gone from the local queue.
+        let json = store.fetch_envelope_json(&envelope_id).await.unwrap();
+        assert!(json.is_none(), "delivered envelope should be expired locally");
+    }
+
+    #[tokio::test]
+    async fn outbound_delivery_attempt_advances_backoff() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        let envelope_id = "env-retry";
+        store
+            .enqueue_outbound_delivery(envelope_id, "https://peer.example")
+            .await
+            .unwrap();
+
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        assert_eq!(due.attempts, 0);
+
+        // Push next_retry_at into the future and bump attempt count.
+        let future = Utc::now() + chrono::Duration::minutes(5);
+        store
+            .mark_delivery_attempt(envelope_id, "https://peer.example", "boom", future)
+            .await
+            .unwrap();
+
+        // Now the row is no longer "due" so next_pending_delivery skips it.
+        let after = store.next_pending_delivery().await.unwrap();
+        assert!(
+            after.is_none(),
+            "row backed off to the future shouldn't be returned, got {:?}",
+            after
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_delivery_expired_is_skipped() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        store
+            .enqueue_outbound_delivery("env-x", "https://peer.example")
+            .await
+            .unwrap();
+        store
+            .mark_delivery_expired("env-x", "https://peer.example")
+            .await
+            .unwrap();
+
+        let next = store.next_pending_delivery().await.unwrap();
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_envelope_json_returns_stored_bytes() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        let env = sample_envelope("amp:did:key:zJsonReader");
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let json = store
+            .fetch_envelope_json(&envelope_id)
+            .await
+            .unwrap()
+            .expect("envelope_json should be present");
+        // Round-trips through serde, so it's well-formed JSON pointing at
+        // the right recipient. We don't assert byte-equality with serde's
+        // input (that's an internal detail of the storage layer).
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["recipient_id"].as_str().unwrap(),
+            "amp:did:key:zJsonReader"
+        );
+
+        // Unknown id → None
+        let missing = store.fetch_envelope_json("env-does-not-exist").await.unwrap();
+        assert!(missing.is_none());
     }
 
     #[tokio::test]
