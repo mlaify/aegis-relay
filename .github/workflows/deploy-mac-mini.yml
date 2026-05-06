@@ -1,0 +1,89 @@
+# Auto-deploy the relay stack to the Mac Mini self-hosted runner whenever
+# main moves on any of the four repos involved in the relay's build:
+# aegis-relay (the binary), aegis-core (path deps), aegis-gateway (sibling
+# service), aegis-deploy (the orchestration). All four ship this same
+# workflow so any commit on any of them refreshes the running stack.
+#
+# The runner is registered at the org level on the Mac Mini with labels
+# `self-hosted` + `mac-mini`. It pulls fresh source for ALL FOUR repos
+# under ~/aegis/, rebuilds the relay container in place, and verifies
+# /healthz before marking the job green.
+#
+# Concurrency is grouped across repos so a flurry of commits doesn't
+# kick off four parallel rebuilds — they queue and the last one wins.
+#
+# To skip a deploy on a non-code commit, include `[skip ci]` in the
+# commit message.
+
+name: Deploy to Mac Mini
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - ".github/**"
+      - "!.github/workflows/deploy-mac-mini.yml"
+      - "LICENSE"
+  workflow_dispatch:
+
+# Single-flight across the whole `mlaify/aegis-*` ecosystem so simultaneous
+# pushes to different repos can't stomp on each other rebuilding the same
+# Docker image.
+concurrency:
+  group: mac-mini-relay-stack
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 30
+
+    steps:
+      - name: Skip if [skip ci] in commit message
+        if: contains(github.event.head_commit.message, '[skip ci]')
+        run: |
+          echo "Skipping deploy per [skip ci]"
+          exit 0
+
+      - name: Pull all four repos
+        run: |
+          set -eu
+          for repo in aegis-relay aegis-core aegis-gateway aegis-deploy; do
+            cd ~/aegis/$repo
+            echo "::group::$repo — git pull"
+            git fetch --quiet origin main
+            git reset --hard origin/main
+            git --no-pager log -1 --format='  HEAD %h %s'
+            echo "::endgroup::"
+          done
+
+      - name: Rebuild + restart the stack
+        working-directory: /Users/${{ github.actor || 'mdavis' }}/aegis/aegis-deploy
+        env:
+          # Same compose file the developer uses locally — keeps "what runs
+          # on the Mini" identical to "what works on my Mac". Switch to
+          # docker-compose.yml (the production CF Tunnel variant) if you
+          # want the Mini fronted publicly.
+          COMPOSE_FILE: docker-compose.local.yml
+        run: |
+          set -eu
+          docker compose -f "$COMPOSE_FILE" --env-file .env.local up -d --build
+
+      - name: Health check
+        run: |
+          set -eu
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8787/healthz > /dev/null 2>&1; then
+              echo "✓ Relay healthy after $((i * 5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "✗ Relay failed to come up healthy in 150s"
+          docker compose -f ~/aegis/aegis-deploy/docker-compose.local.yml logs --tail=80 relay
+          exit 1
+
+      - name: Show running containers
+        if: always()
+        run: docker compose -f ~/aegis/aegis-deploy/docker-compose.local.yml ps
