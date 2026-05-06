@@ -358,15 +358,24 @@ pub trait Store: Send + Sync {
         next_retry_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Mark a delivery as `delivered` AND drop the local envelope copy.
-    /// The envelope-deletion is part of the same SQL transaction so we
-    /// can't end up with a row claiming "delivered" while the envelope
-    /// still sits in the queue for the recipient to fetch locally.
+    /// Mark a delivery as `delivered`, drop the local envelope copy,
+    /// AND flip every other still-`pending` row for the same envelope
+    /// to `superseded` (#30 multi-target failover).
+    ///
+    /// All three writes happen in a single SQL transaction so we can't
+    /// end up with stale "still pending" siblings after the envelope is
+    /// known to have landed somewhere, nor with a "delivered" row whose
+    /// envelope still sits in the local queue.
+    ///
+    /// Returns the list of target URLs that got transitioned from
+    /// `pending` → `superseded` so the federation worker can audit-log
+    /// each one with the same level of detail it produced when they
+    /// were initially attempted.
     async fn mark_delivery_delivered(
         &self,
         envelope_id: &str,
         target_url: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Mark a delivery as `expired` (max attempts exhausted). The local
     /// envelope copy is preserved — the operator may still want to retry
@@ -816,8 +825,8 @@ impl Store for FileStore {
         &self,
         _envelope_id: &str,
         _target_url: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
     }
 
     async fn mark_delivery_expired(
@@ -1961,34 +1970,74 @@ impl Store for SqliteStore {
         &self,
         envelope_id: &str,
         target_url: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let envelope_id = envelope_id.to_string();
         let target_url = target_url.to_string();
         let now = Utc::now().to_rfc3339();
-        // Atomic: flip the row to 'delivered' AND drop the local envelope
-        // copy. The spec calls for "expire local copy" on ACK so the
-        // envelope doesn't sit around forever in this relay's queue
-        // duplicating what the recipient's authoritative relay now holds.
-        self.conn
+        // One transaction:
+        //   1. Snapshot the still-`pending` siblings BEFORE we touch them
+        //      (we need the URL list to return so the worker can audit-
+        //      log each transition).
+        //   2. Flip the winning row to 'delivered'.
+        //   3. Flip the siblings to 'superseded'.
+        //   4. Drop the local envelope copy.
+        // If the transaction fails partway, none of these writes apply
+        // and the worker will retry the delivery on the next tick.
+        let envelope_for_call = envelope_id.clone();
+        let target_for_call = target_url.clone();
+        let superseded = self
+            .conn
             .call(move |conn| {
                 let tx = conn.unchecked_transaction()?;
+
+                // Capture the URLs of pending siblings — same envelope,
+                // different target, status still 'pending' — so we can
+                // tell the worker exactly which ones we're collapsing.
+                let mut stmt = tx.prepare(
+                    "SELECT target_url FROM outbound_deliveries \
+                     WHERE envelope_id = ?1 AND status = 'pending' AND target_url <> ?2",
+                )?;
+                let siblings: Vec<String> = stmt
+                    .query_map(
+                        rusqlite::params![envelope_for_call, target_for_call],
+                        |r| r.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+
+                // 2. Mark the winner delivered.
                 tx.execute(
                     "UPDATE outbound_deliveries \
                      SET status = 'delivered', \
                          delivered_at = ?1, \
                          last_attempt_at = ?1 \
                      WHERE envelope_id = ?2 AND target_url = ?3",
-                    rusqlite::params![now, envelope_id, target_url],
+                    rusqlite::params![now, envelope_for_call, target_for_call],
                 )?;
+
+                // 3. Bulk-flip pending siblings to 'superseded' so
+                //    `next_pending_delivery` won't return them. We don't
+                //    bump `attempts` here — being superseded isn't a
+                //    failed attempt.
+                tx.execute(
+                    "UPDATE outbound_deliveries \
+                     SET status = 'superseded', last_attempt_at = ?1 \
+                     WHERE envelope_id = ?2 AND status = 'pending' AND target_url <> ?3",
+                    rusqlite::params![now, envelope_for_call, target_for_call],
+                )?;
+
+                // 4. Drop the local envelope; the recipient's
+                //    authoritative relay holds it now.
                 tx.execute(
                     "DELETE FROM envelopes WHERE envelope_id = ?1",
-                    rusqlite::params![envelope_id],
+                    rusqlite::params![envelope_for_call],
                 )?;
+
                 tx.commit()?;
-                Ok(())
+                Ok(siblings)
             })
             .await?;
-        Ok(())
+        Ok(superseded)
     }
 
     async fn mark_delivery_expired(
@@ -3062,10 +3111,16 @@ mod tests {
         assert_eq!(due.attempts, 0);
 
         // Mark delivered: status → 'delivered' AND envelope is purged.
-        store
+        // Single-target case: there are no siblings to supersede.
+        let superseded = store
             .mark_delivery_delivered(&envelope_id, "https://peer.example/v1/envelopes")
             .await
             .unwrap();
+        assert!(
+            superseded.is_empty(),
+            "single-target delivery should report no superseded siblings, got {:?}",
+            superseded
+        );
 
         // No longer pending.
         let after = store.next_pending_delivery().await.unwrap();
