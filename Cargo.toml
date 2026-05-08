@@ -7,6 +7,16 @@ edition = "2021"
 aegis-proto = { path = "../aegis-core/crates/aegis-proto" }
 aegis-api-types = { path = "../aegis-core/crates/aegis-api-types" }
 aegis-identity = { path = "../aegis-core/crates/aegis-identity" }
+# Phase 6 federation auth (#32): relay generates its own hybrid signing
+# identity at first boot to attest to delivery receipts. aegis-crypto's
+# `HybridPqKeyBundle::generate()` produces the Ed25519 + ML-DSA-65 keypair
+# we use; previously this crate was a dev-dep only.
+aegis-crypto = { path = "../aegis-core/crates/aegis-crypto" }
+# Direct primitives for receipt signing in `relay_identity::sign_receipt`.
+# Versions match what aegis-core's workspace pins (kept in sync manually
+# since aegis-relay isn't part of that workspace).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+ml-dsa = { version = "0.1.0-rc.9", features = ["rand_core"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,4 +39,3 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-aegis-crypto = { path = "../aegis-core/crates/aegis-crypto" }

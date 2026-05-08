@@ -285,11 +285,33 @@ pub(crate) async fn deliver_one(
 
     match resp {
         Ok(r) if r.status().is_success() => {
+            let status = r.status();
+            // Phase 6 (#32): try to capture the signed receipt the peer
+            // returned in the response body. We pull the body as JSON
+            // and extract the optional `receipt` object — if the peer
+            // is on an older relay version they won't return one, and
+            // we treat that as "ack OK, no proof on file". Receipt
+            // VALIDATION (verifying the signature against the peer's
+            // published identity) is the work in #32 part 2; this PR
+            // only persists what the peer says.
+            let receipt_json: Option<String> = match r.text().await {
+                Ok(text) => extract_receipt_field(&text),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "federation",
+                        error = %e,
+                        envelope_id = %delivery.envelope_id,
+                        "could not read response body; treating as ack-only"
+                    );
+                    None
+                }
+            };
             tracing::info!(
                 target: "federation",
                 envelope_id = %delivery.envelope_id,
                 target = %delivery.target_url,
-                status = %r.status(),
+                status = %status,
+                has_receipt = receipt_json.is_some(),
                 "delivered"
             );
             state
@@ -301,9 +323,27 @@ pub(crate) async fn deliver_one(
                     recipient_id: None,
                     envelope_id: Some(&delivery.envelope_id),
                     identity_id: None,
-                    detail: Some(&delivery.target_url),
+                    detail: Some(&format!(
+                        "{} receipt={}",
+                        delivery.target_url,
+                        if receipt_json.is_some() { "yes" } else { "no" },
+                    )),
                 })
                 .await;
+            if let Some(rj) = &receipt_json {
+                if let Err(e) = state
+                    .store
+                    .save_delivery_receipt(&delivery.envelope_id, &delivery.target_url, rj)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "federation",
+                        error = %e,
+                        envelope_id = %delivery.envelope_id,
+                        "save_delivery_receipt failed; receipt is not persisted but delivery succeeded"
+                    );
+                }
+            }
             match state
                 .store
                 .mark_delivery_delivered(&delivery.envelope_id, &delivery.target_url)
@@ -462,6 +502,24 @@ async fn schedule_retry(
         .await;
 }
 
+/// Pull the optional `receipt` JSON out of the peer's
+/// `StoreEnvelopeResponse` body without round-tripping through a typed
+/// struct. Keeps the wire format relaxed: a peer running an older
+/// relay (no receipt at all) returns `None`; one running #32 returns
+/// a `serde_json::Value` we re-stringify for storage.
+///
+/// We deliberately don't validate the receipt's signature here — that
+/// stage ships in #32 part 2 once we've also done discovery-doc
+/// fetching. For PR 1, persisting the bytes is enough.
+fn extract_receipt_field(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let receipt = v.get("receipt")?;
+    if receipt.is_null() {
+        return None;
+    }
+    serde_json::to_string(receipt).ok()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -589,6 +647,7 @@ mod tests {
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url,
+            relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
         })
     }
 
@@ -699,6 +758,51 @@ mod tests {
     }
 
     // --- End-to-end with a mock remote relay ----------------------------
+
+    // --- Receipt extraction (mlaify/aegis-relay#32) ----------------------
+
+    #[test]
+    fn extract_receipt_field_pulls_object_from_response_body() {
+        let body = r#"{
+            "accepted": true,
+            "relay_id": "amp:did:key:zRelayPeer",
+            "receipt": {
+                "envelope_id": "env-1",
+                "received_at": "2026-05-08T03:14:15Z",
+                "receiver_relay_id": "amp:did:key:zRelayPeer",
+                "signature": "ed25519:abc|dilithium3:def"
+            }
+        }"#;
+        let extracted = extract_receipt_field(body).expect("receipt present");
+        // Round-trip: must parse back to a JSON object with the same keys.
+        let v: serde_json::Value = serde_json::from_str(&extracted).unwrap();
+        assert_eq!(v["envelope_id"], "env-1");
+        assert!(v["signature"].as_str().unwrap().starts_with("ed25519:"));
+    }
+
+    #[test]
+    fn extract_receipt_field_returns_none_for_missing_field() {
+        // Older relays (pre-#32) won't include `receipt` at all.
+        // Sender treats this as "ack OK, no receipt on file".
+        let body = r#"{"accepted": true, "relay_id": "old-relay"}"#;
+        assert!(extract_receipt_field(body).is_none());
+    }
+
+    #[test]
+    fn extract_receipt_field_returns_none_for_explicit_null() {
+        // `"receipt": null` is semantically the same as missing.
+        // Defensive parse path so we don't store the literal string "null".
+        let body = r#"{"accepted": true, "relay_id": "old-relay", "receipt": null}"#;
+        assert!(extract_receipt_field(body).is_none());
+    }
+
+    #[test]
+    fn extract_receipt_field_returns_none_for_garbage_body() {
+        // If the body isn't JSON at all (proxy error page, etc.), we
+        // shouldn't panic — just yield None and let the caller log.
+        assert!(extract_receipt_field("502 bad gateway").is_none());
+        assert!(extract_receipt_field("").is_none());
+    }
 
     #[tokio::test]
     async fn maybe_enqueue_skips_when_recipient_only_lists_self() {

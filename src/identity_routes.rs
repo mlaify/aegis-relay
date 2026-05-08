@@ -288,6 +288,7 @@ mod tests {
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: None,
+            relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
         });
         Router::new()
             .route("/v1/identities/:identity_id", put(super::put_identity))

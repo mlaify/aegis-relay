@@ -26,6 +26,13 @@ pub struct DiscoveryDocument {
     pub relay_url: String,
     pub supported_suites: Vec<&'static str>,
     pub policy: DiscoveryPolicy,
+    /// Phase 6 (#32): the relay's own signed `IdentityDocument`.
+    /// Senders fetch this once + cache; they verify delivery receipts
+    /// against the `signing_keys` listed here. Older relays (no #32)
+    /// omit this field — peers degrade gracefully to "receipt
+    /// unverifiable, treat as opaque ack".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_identity: Option<aegis_proto::IdentityDocument>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +98,13 @@ pub async fn well_known_aegis_config(
     let rt = state.runtime.read().unwrap();
     let registration = "managed";
 
+    // Parse the persisted relay identity (signed at boot) and
+    // expose its public document. We swallow parse failures rather
+    // than fail the whole discovery doc — a malformed identity
+    // shouldn't take down discovery for senders that don't need
+    // receipts.
+    let relay_identity_doc = crate::relay_identity::public_document(&state.relay_identity).ok();
+
     Json(DiscoveryDocument {
         version: 1,
         domain: chosen.domain,
@@ -101,6 +115,7 @@ pub async fn well_known_aegis_config(
             require_token_for_push: rt.require_token_for_push,
             require_token_for_identity_put: rt.require_token_for_identity_put,
         },
+        relay_identity: relay_identity_doc,
     })
     .into_response()
 }
@@ -129,6 +144,7 @@ mod tests {
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: Some("https://relay.example.test".into()),
+            relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
         })
     }
 
@@ -181,7 +197,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        // 32 KiB headroom — the response now embeds the relay's full
+        // signed identity document including the ML-DSA-65 public key
+        // (~1.9 KiB on its own) since #32, so the historical 8 KiB cap
+        // overflows.
+        let body = axum::body::to_bytes(resp.into_body(), 32_768).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["domain"], "example.test");
         assert_eq!(json["relay_url"], "https://relay.example.test");

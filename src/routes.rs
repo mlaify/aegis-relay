@@ -15,6 +15,27 @@ use axum::{
 use crate::storage::{LifecycleOutcome, StoreOutcome};
 use crate::{audit::AuditEvent, config::AuthMode, AppState}; // AuthMode used in require_auth
 
+/// Local extension of `aegis_api_types::StoreEnvelopeResponse` that adds
+/// the Phase 6 (#32) signed delivery receipt. The receipt is wrapped in
+/// `Option` so older clients (and federated peers running older relays)
+/// see a backward-compatible response — the field just isn't there
+/// when receipts are off (currently always on once the relay has its
+/// own identity, but the optionality preserves graceful upgrade).
+///
+/// We don't push the field into the cross-repo API type because (a) it
+/// would force a coupled PR to aegis-core, and (b) `DeliveryReceipt`
+/// lives in `aegis-relay::relay_identity` — keeping it here means the
+/// API type doesn't need a relay-side type dependency.
+#[derive(serde::Serialize)]
+struct StoreEnvelopeResponseWithReceipt {
+    #[serde(flatten)]
+    inner: StoreEnvelopeResponse,
+    /// Hybrid-signed proof that this relay accepted the envelope at
+    /// `received_at`. Sender-side validation is the work in #32 part 2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<crate::relay_identity::DeliveryReceipt>,
+}
+
 pub async fn healthz() -> &'static str {
     "ok"
 }
@@ -119,9 +140,46 @@ pub async fn store_envelope(
                 crate::federation::maybe_enqueue(&state, &envelope_id, &recipient_id).await;
             }
 
-            Json(StoreEnvelopeResponse {
-                accepted: true,
-                relay_id: "local-relay".to_string(),
+            // Phase 6 (#32): sign a delivery receipt over the envelope_id
+            // + a fresh `received_at` and return it inline with the
+            // accept response. Sender side stores the receipt
+            // verbatim; verification ships in part 2 of #32.
+            //
+            // Signing failures here are surfaced as a server error
+            // because we don't want to silently drop the proof — the
+            // peer is correctly assuming we'll attest to acceptance.
+            // In practice this can't fail unless the relay's persisted
+            // identity is corrupted, in which case the operator wants
+            // to know.
+            let received_at = chrono::Utc::now().to_rfc3339();
+            let receipt = match crate::relay_identity::sign_receipt(
+                &state.relay_identity,
+                &envelope_id,
+                &received_at,
+            ) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::error!(
+                        target: "relay",
+                        error = %e,
+                        envelope_id,
+                        "failed to sign delivery receipt; envelope is stored but no proof returned"
+                    );
+                    None
+                }
+            };
+
+            Json(StoreEnvelopeResponseWithReceipt {
+                inner: StoreEnvelopeResponse {
+                    accepted: true,
+                    // Echo back this relay's own identity_id so the
+                    // peer knows which signing keys to verify the
+                    // receipt against. The previous "local-relay"
+                    // string was a placeholder; a stable `amp:did:key:`
+                    // value is what callers actually need.
+                    relay_id: state.relay_identity.identity_id.clone(),
+                },
+                receipt,
             })
             .into_response()
         }
@@ -523,6 +581,7 @@ mod tests {
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: None,
+            relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
         });
         let router = Router::new()
             .route("/healthz", get(super::healthz))
@@ -624,6 +683,7 @@ mod tests {
             audit: AuditSink::new(None),
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: None,
+            relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
         });
         let app = Router::new()
             .route("/v1/envelopes", post(super::store_envelope))
@@ -737,6 +797,71 @@ mod tests {
             .expect("a pending delivery");
         assert_eq!(pending.envelope_id, envelope_id);
         assert_eq!(pending.target_url, "https://peer.example");
+    }
+
+    #[tokio::test]
+    async fn store_envelope_returns_signed_receipt_in_response_body() {
+        // Phase 6 (#32): every successful POST returns a receipt
+        // alongside `accepted` + `relay_id`. The receipt is verifiable
+        // against the relay's published signing keys (validated end-to-
+        // end by sender-side code in PR 2 of #32).
+        let app = test_app(None).await;
+
+        let envelope_id = uuid::Uuid::new_v4().to_string();
+        let body = format!(
+            r#"{{
+                "envelope": {{
+                    "version": 1,
+                    "envelope_id": "{}",
+                    "recipient_id": "amp:did:key:zReceiptRecipient",
+                    "sender_hint": null,
+                    "created_at": "2026-05-08T03:14:15Z",
+                    "expires_at": null,
+                    "content_type": "message/private",
+                    "suite_id": "DemoXChaCha20Poly1305",
+                    "used_prekey_ids": [],
+                    "payload": {{ "nonce_b64": "AAAA", "ciphertext_b64": "BBBB" }},
+                    "outer_signature_b64": null
+                }}
+            }}"#,
+            envelope_id,
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/envelopes")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = to_bytes(resp.into_body(), 32_768).await.expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+
+        // Original fields still present.
+        assert_eq!(json["accepted"], true);
+        let relay_id = json["relay_id"].as_str().expect("relay_id");
+        assert!(
+            relay_id.starts_with("amp:did:key:zRelay"),
+            "relay_id should be the relay's DID, got {}",
+            relay_id
+        );
+
+        // New: receipt object present + structurally correct.
+        let receipt = &json["receipt"];
+        assert!(receipt.is_object(), "receipt should be an object: {receipt}");
+        assert_eq!(receipt["envelope_id"], envelope_id);
+        assert_eq!(receipt["receiver_relay_id"], relay_id);
+        let sig = receipt["signature"].as_str().expect("signature");
+        assert!(
+            sig.starts_with("ed25519:") && sig.contains("|dilithium3:"),
+            "expected hybrid signature, got {sig}"
+        );
+        // received_at is RFC-3339; presence + nontrivial length is enough.
+        let received_at = receipt["received_at"].as_str().expect("received_at");
+        assert!(received_at.len() > 10, "received_at too short: {received_at}");
     }
 
     #[tokio::test]

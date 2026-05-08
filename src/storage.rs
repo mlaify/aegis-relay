@@ -123,6 +123,23 @@ pub struct OutboundDelivery {
     pub created_at: String,
 }
 
+/// The relay's own hybrid signing identity, used to sign delivery
+/// receipts (#32). Loaded once at boot and kept in `AppState`. Both
+/// JSON fields are the same shapes the FFI emits for client identities
+/// — round-trip-compatible with `aegis_proto::IdentityDocument` and
+/// `aegis_identity::HybridPqPrivateKeyMaterial`.
+#[derive(Debug, Clone)]
+pub struct RelayIdentity {
+    pub identity_id: String,
+    /// The signed `IdentityDocument` JSON. Exposed verbatim via
+    /// `/.well-known/aegis-config` so peers can discover this relay's
+    /// signing keys for receipt verification.
+    pub document_json: String,
+    /// `HybridPqPrivateKeyMaterial` JSON. Stays inside the relay; never
+    /// served. Used to sign receipts.
+    pub secrets_json: String,
+}
+
 /// Aggregated snapshot of the federation queue, returned by
 /// `Storage::federation_metrics`. Used to back `GET /admin/federation/metrics`
 /// (mlaify/aegis-relay#31). `recent_*` counts are scoped to the
@@ -442,6 +459,37 @@ pub trait Store: Send + Sync {
         &self,
         window_seconds: i64,
     ) -> Result<FederationMetricsSnapshot, Box<dyn std::error::Error + Send + Sync>>;
+
+    // -- Relay self-identity (#32) --------------------------------------------
+
+    /// Load the relay's own signing identity (slot='primary'), or `None`
+    /// if it hasn't been generated yet. Called at startup; if `None`,
+    /// the boot path generates a fresh identity and persists it via
+    /// [`save_relay_identity`].
+    async fn load_relay_identity(
+        &self,
+    ) -> Result<Option<RelayIdentity>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Persist a freshly-generated relay identity. Idempotent on
+    /// `slot='primary'` — calling again with a different identity
+    /// overwrites the existing one (intentional, but the boot path
+    /// only writes when load returned `None`).
+    async fn save_relay_identity(
+        &self,
+        identity: &RelayIdentity,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Persist the signed delivery receipt that came back from a peer
+    /// when a federation push succeeded. Used by the federation worker
+    /// after a successful delivery; the JSON is exactly the
+    /// `DeliveryReceipt` blob the peer returned in its response body.
+    /// (#32)
+    async fn save_delivery_receipt(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+        receipt_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +951,28 @@ impl Store for FileStore {
             targets: Vec::new(),
         })
     }
+
+    async fn load_relay_identity(
+        &self,
+    ) -> Result<Option<RelayIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn save_relay_identity(
+        &self,
+        _identity: &RelayIdentity,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn save_delivery_receipt(
+        &self,
+        _envelope_id: &str,
+        _target_url: &str,
+        _receipt_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -970,8 +1040,10 @@ const MIGRATIONS: &str = "
 
     -- Phase 5 federation queue (mlaify/aegis-relay#28). One row per
     -- (envelope, target relay) pair. Status flows pending → delivered |
-    -- expired. The composite PK keeps `enqueue_outbound_delivery`
-    -- idempotent without a separate UNIQUE constraint.
+    -- expired | superseded (#30). Receipt_json (#32) starts NULL and
+    -- gets populated when a peer returns a signed delivery receipt.
+    -- The composite PK keeps `enqueue_outbound_delivery` idempotent
+    -- without a separate UNIQUE constraint.
     CREATE TABLE IF NOT EXISTS outbound_deliveries (
         envelope_id TEXT NOT NULL,
         target_url TEXT NOT NULL,
@@ -982,10 +1054,25 @@ const MIGRATIONS: &str = "
         last_attempt_at TEXT,
         created_at TEXT NOT NULL,
         delivered_at TEXT,
+        receipt_json TEXT,
         PRIMARY KEY (envelope_id, target_url)
     );
     CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_due
         ON outbound_deliveries(status, next_retry_at);
+
+    -- Phase 6 federation auth (#32): the relay's own hybrid identity,
+    -- used to sign delivery receipts. Single-row table — keyed on
+    -- `slot='primary'` so future rotation can introduce 'next' / 'old'
+    -- slots without a schema change. `secrets_json` is the
+    -- HybridPqPrivateKeyMaterial JSON; `document_json` is the SIGNED
+    -- IdentityDocument JSON published via /.well-known/aegis-config.
+    CREATE TABLE IF NOT EXISTS relay_identity (
+        slot TEXT PRIMARY KEY,
+        identity_id TEXT NOT NULL,
+        document_json TEXT NOT NULL,
+        secrets_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
 ";
 
 pub struct SqliteStore {
@@ -995,18 +1082,59 @@ pub struct SqliteStore {
 impl SqliteStore {
     pub async fn open(path: &str) -> Result<Self, tokio_rusqlite::Error> {
         let conn = Connection::open(path).await?;
-        conn.call(|c| c.execute_batch(MIGRATIONS).map_err(|e| e.into()))
-            .await?;
+        conn.call(|c| {
+            c.execute_batch(MIGRATIONS)?;
+            run_post_init_migrations(c)?;
+            Ok(())
+        })
+        .await?;
         Ok(Self { conn })
     }
 
     #[allow(dead_code)]
     pub async fn open_in_memory() -> Result<Self, tokio_rusqlite::Error> {
         let conn = Connection::open_in_memory().await?;
-        conn.call(|c| c.execute_batch(MIGRATIONS).map_err(|e| e.into()))
-            .await?;
+        conn.call(|c| {
+            c.execute_batch(MIGRATIONS)?;
+            run_post_init_migrations(c)?;
+            Ok(())
+        })
+        .await?;
         Ok(Self { conn })
     }
+}
+
+/// Idempotent migrations that don't fit the "CREATE TABLE IF NOT EXISTS"
+/// pattern — primarily, `ALTER TABLE ADD COLUMN` for columns we added
+/// after a table was originally shipped. SQLite has no native
+/// `ADD COLUMN IF NOT EXISTS`, so we feature-detect via `pragma_table_info`
+/// and only ALTER when the column's missing.
+fn run_post_init_migrations(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        c,
+        "outbound_deliveries",
+        "receipt_json",
+        "ALTER TABLE outbound_deliveries ADD COLUMN receipt_json TEXT",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    c: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT 1 FROM pragma_table_info('{}') WHERE name = ?1",
+        table
+    ))?;
+    let present = stmt.exists(rusqlite::params![column])?;
+    drop(stmt);
+    if !present {
+        c.execute(alter_sql, [])?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -2273,6 +2401,88 @@ impl Store for SqliteStore {
 
         Ok(FederationMetricsSnapshot { queue, targets })
     }
+
+    // -- Relay self-identity (#32) -------------------------------------------
+
+    async fn load_relay_identity(
+        &self,
+    ) -> Result<Option<RelayIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = self
+            .conn
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT identity_id, document_json, secrets_json \
+                     FROM relay_identity WHERE slot = 'primary'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(row.map(|(identity_id, document_json, secrets_json)| RelayIdentity {
+            identity_id,
+            document_json,
+            secrets_json,
+        }))
+    }
+
+    async fn save_relay_identity(
+        &self,
+        identity: &RelayIdentity,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // ON CONFLICT UPDATE so the boot path can call this
+        // unconditionally; in practice it's only invoked when load
+        // returned None, but defensiveness here is cheap.
+        let identity_id = identity.identity_id.clone();
+        let document_json = identity.document_json.clone();
+        let secrets_json = identity.secrets_json.clone();
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO relay_identity (slot, identity_id, document_json, secrets_json, created_at) \
+                     VALUES ('primary', ?1, ?2, ?3, ?4) \
+                     ON CONFLICT(slot) DO UPDATE SET \
+                        identity_id = excluded.identity_id, \
+                        document_json = excluded.document_json, \
+                        secrets_json = excluded.secrets_json, \
+                        created_at = excluded.created_at",
+                    rusqlite::params![identity_id, document_json, secrets_json, now],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn save_delivery_receipt(
+        &self,
+        envelope_id: &str,
+        target_url: &str,
+        receipt_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let target_url = target_url.to_string();
+        let receipt_json = receipt_json.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE outbound_deliveries SET receipt_json = ?1 \
+                     WHERE envelope_id = ?2 AND target_url = ?3",
+                    rusqlite::params![receipt_json, envelope_id, target_url],
+                )
+                .map_err(|e| e.into())
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 /// Return the `p`-th percentile of a sorted-ascending slice of attempt
@@ -2322,7 +2532,7 @@ fn is_expired(envelope: &Envelope) -> bool {
 mod tests {
     use super::{
         percentile, ClaimAliasOutcome, FileStore, LifecycleOutcome, ProvisionOutcome, QueueStats,
-        SqliteStore, Store, StoreOutcome,
+        RelayIdentity, SqliteStore, Store, StoreOutcome,
     };
     use crate::config::RetentionPolicy;
     use aegis_proto::{
@@ -3708,6 +3918,97 @@ mod tests {
             "expected ~300s, got {age}"
         );
         assert_eq!(snap.queue.pending, 1);
+    }
+
+    // --- Relay self-identity (mlaify/aegis-relay#32) ----------------------
+
+    #[tokio::test]
+    async fn relay_identity_round_trip() {
+        // Save → load → equality. SqliteStore is the only persistent
+        // backend; FileStore is a dev scaffold that returns None.
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+
+        // Empty store starts with no identity.
+        assert!(store.load_relay_identity().await.unwrap().is_none());
+
+        let identity = RelayIdentity {
+            identity_id: "amp:did:key:zRelayTest".to_string(),
+            document_json: r#"{"version":1,"identity_id":"amp:did:key:zRelayTest"}"#
+                .to_string(),
+            secrets_json: r#"{"identity_id":"amp:did:key:zRelayTest","algorithm":"AMP-HYBRID-PQ-PRIVATE-V1","x25519_private_key_b64":"","kyber768_secret_key_b64":"","ed25519_signing_seed_b64":"","dilithium3_secret_key_b64":""}"#
+                .to_string(),
+        };
+        store.save_relay_identity(&identity).await.unwrap();
+
+        let loaded = store.load_relay_identity().await.unwrap().expect("loaded");
+        assert_eq!(loaded.identity_id, identity.identity_id);
+        assert_eq!(loaded.document_json, identity.document_json);
+        assert_eq!(loaded.secrets_json, identity.secrets_json);
+    }
+
+    #[tokio::test]
+    async fn relay_identity_save_overwrites_existing_slot() {
+        // The boot path only saves when load returned None, but the
+        // storage layer accepts repeated saves (UPSERT). Belt-and-
+        // suspenders: confirm rotation would Just Work if we ever
+        // wire it.
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        for ident_id in ["amp:did:key:zRelayA", "amp:did:key:zRelayB"] {
+            let identity = RelayIdentity {
+                identity_id: ident_id.to_string(),
+                document_json: format!(r#"{{"identity_id":"{ident_id}"}}"#),
+                secrets_json: format!(r#"{{"identity_id":"{ident_id}"}}"#),
+            };
+            store.save_relay_identity(&identity).await.unwrap();
+        }
+        let loaded = store.load_relay_identity().await.unwrap().expect("loaded");
+        assert_eq!(loaded.identity_id, "amp:did:key:zRelayB");
+    }
+
+    #[tokio::test]
+    async fn save_delivery_receipt_persists_json_blob() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        store
+            .enqueue_outbound_delivery("env-r", "https://peer.example")
+            .await
+            .unwrap();
+
+        let receipt = r#"{"envelope_id":"env-r","received_at":"2026-…","receiver_relay_id":"amp:did:key:zPeer","signature":"ed25519:…|dilithium3:…"}"#;
+        store
+            .save_delivery_receipt("env-r", "https://peer.example", receipt)
+            .await
+            .unwrap();
+
+        // Verify by reading the column directly. The `next_pending_delivery`
+        // type doesn't include receipt_json; it's an admin-only field
+        // surfaced by `GET /admin/deliveries/:envelope_id` (PR 2 of #32).
+        let stored: Option<String> = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT receipt_json FROM outbound_deliveries WHERE envelope_id = 'env-r'",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .map_err(|e| e.into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn save_delivery_receipt_is_a_no_op_for_unknown_row() {
+        // The federation worker calls save_delivery_receipt only after
+        // a successful delivery, so the row must exist. But if it
+        // doesn't (e.g. a race where the row got expired between the
+        // peer ACK and our write), we don't want a hard error — just
+        // log via the caller. Storage layer just no-ops.
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        let r = store
+            .save_delivery_receipt("not-here", "https://wherever", r#"{"x":1}"#)
+            .await;
+        assert!(r.is_ok());
     }
 
     #[tokio::test]

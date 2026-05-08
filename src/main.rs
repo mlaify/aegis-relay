@@ -6,6 +6,7 @@ mod federation;
 mod identity_routes;
 mod prekey_routes;
 mod prometheus;
+mod relay_identity;
 mod routes;
 mod storage;
 
@@ -27,6 +28,11 @@ pub struct AppState {
     pub audit: audit::AuditSink,
     pub runtime_config_path: PathBuf,
     pub public_url: Option<String>,
+    /// The relay's own hybrid signing identity (#32). Loaded once at
+    /// startup and used to sign delivery receipts on inbound POSTs.
+    /// Wrapped in `Arc` so the federation handler can clone the
+    /// `AppState` cheaply across spawned tasks.
+    pub relay_identity: Arc<storage::RelayIdentity>,
 }
 
 #[tokio::main]
@@ -45,13 +51,49 @@ async fn main() {
     let public_url = cfg.public_url.clone();
     let runtime = cfg.into_shared_runtime();
 
+    // Phase 6 (#32): load or generate the relay's own signing identity.
+    // The identity is small (a few KB of JSON) and cached for the
+    // process lifetime — re-reading it from SQLite on every receipt
+    // would be wasteful. Generation is one-shot per fresh database;
+    // every subsequent boot loads the same persisted identity so
+    // peers' cached signing keys stay valid across relay restarts.
+    let store_arc: Arc<dyn Store> = Arc::new(store);
+    let relay_identity = match store_arc
+        .load_relay_identity()
+        .await
+        .expect("query relay_identity")
+    {
+        Some(existing) => {
+            tracing::info!(
+                identity_id = %existing.identity_id,
+                "loaded existing relay identity from storage"
+            );
+            existing
+        }
+        None => {
+            tracing::info!("no relay identity on disk; generating a fresh one");
+            let fresh = relay_identity::generate()
+                .expect("generate relay identity");
+            store_arc
+                .save_relay_identity(&fresh)
+                .await
+                .expect("persist relay identity");
+            tracing::info!(
+                identity_id = %fresh.identity_id,
+                "generated + persisted relay identity"
+            );
+            fresh
+        }
+    };
+
     let state = Arc::new(AppState {
-        store: Arc::new(store),
+        store: store_arc,
         runtime,
         admin_token,
         audit: audit::AuditSink::new(audit_log_path),
         runtime_config_path,
         public_url,
+        relay_identity: Arc::new(relay_identity),
     });
 
     // Phase 5 (#28): start the federation delivery worker. Off by default
