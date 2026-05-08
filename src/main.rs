@@ -5,6 +5,7 @@ mod discovery;
 mod federation;
 mod identity_routes;
 mod prekey_routes;
+mod prometheus;
 mod routes;
 mod storage;
 
@@ -141,7 +142,20 @@ async fn main() {
         .route(
             "/admin/users/:alias",
             delete(admin_routes::admin_deprovision_user),
-        )
+        );
+
+    // Optional Prometheus exposition (#31). Off by default — operators
+    // opt in with `AEGIS_PROMETHEUS_ENABLED=true`. When disabled the
+    // route isn't registered, so `GET /metrics` returns axum's standard
+    // 404 (a deliberate "endpoint missing" signal vs an empty body).
+    let app = if prometheus::is_enabled() {
+        tracing::info!("Prometheus metrics enabled at /metrics (no auth)");
+        app.route("/metrics", get(prometheus::metrics_handler))
+    } else {
+        app
+    };
+
+    let app = app
         .with_state(state)
         .layer(
             CorsLayer::new()
