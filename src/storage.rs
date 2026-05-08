@@ -123,6 +123,54 @@ pub struct OutboundDelivery {
     pub created_at: String,
 }
 
+/// Aggregated snapshot of the federation queue, returned by
+/// `Storage::federation_metrics`. Used to back `GET /admin/federation/metrics`
+/// (mlaify/aegis-relay#31). `recent_*` counts are scoped to the
+/// caller-supplied sliding window (default 24h at the route layer).
+#[derive(Debug, Clone)]
+pub struct FederationMetricsSnapshot {
+    pub queue: QueueStats,
+    pub targets: Vec<TargetStats>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueStats {
+    /// Rows currently in `status='pending'` regardless of when they were
+    /// enqueued. The freshest indicator of real-time backlog.
+    pub pending: u64,
+    /// Rows that flipped to `delivered` within the window. Counted by
+    /// `delivered_at` so retroactive operator queries see consistent data.
+    pub delivered_recent: u64,
+    /// Rows that exhausted retries within the window.
+    pub expired_recent: u64,
+    /// Rows superseded by a sibling target's success within the window
+    /// (multi-target failover, #30).
+    pub superseded_recent: u64,
+    /// Age in whole seconds of the oldest still-pending row. `None` when
+    /// the queue is empty — operators read this as "everything's clean".
+    pub oldest_pending_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetStats {
+    pub target_url: String,
+    pub pending: u64,
+    pub delivered_recent: u64,
+    pub expired_recent: u64,
+    pub superseded_recent: u64,
+    /// 50th percentile of `attempts` across delivered rows in the window.
+    /// 1 means most envelopes succeeded on the first try.
+    pub p50_attempts: u32,
+    /// 95th percentile of `attempts`. Diverging p50 vs p95 is the signal
+    /// of "a meaningful slice of traffic is fighting backoff" — the most
+    /// useful number for spotting a degraded peer.
+    pub p95_attempts: u32,
+    /// Most-recent `delivered_at` for this target within the window.
+    pub last_success_at: Option<String>,
+    /// Most-recent `last_attempt_at` for an `expired` row in the window.
+    pub last_failure_at: Option<String>,
+}
+
 /// Outcome of `claim_provisioned_alias` — used during identity PUT to enforce
 /// that an alias reserved for one identity_id cannot be hijacked by another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +433,15 @@ pub trait Store: Send + Sync {
         envelope_id: &str,
         target_url: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Aggregated metrics over the federation queue, scoped to a sliding
+    /// `window_seconds` (typically 86400 for a day). Returns queue-level
+    /// totals + per-target rollups including p50/p95 attempt counts.
+    /// Drives `GET /admin/federation/metrics` (#31).
+    async fn federation_metrics(
+        &self,
+        window_seconds: i64,
+    ) -> Result<FederationMetricsSnapshot, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +892,16 @@ impl Store for FileStore {
         _target_url: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+
+    async fn federation_metrics(
+        &self,
+        _window_seconds: i64,
+    ) -> Result<FederationMetricsSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(FederationMetricsSnapshot {
+            queue: QueueStats::default(),
+            targets: Vec::new(),
+        })
     }
 }
 
@@ -2061,6 +2128,166 @@ impl Store for SqliteStore {
             .await?;
         Ok(())
     }
+
+    async fn federation_metrics(
+        &self,
+        window_seconds: i64,
+    ) -> Result<FederationMetricsSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+        // Cutoff for the sliding window. Uses chrono so SQLite gets a
+        // lexicographically-comparable RFC-3339 string; existing storage
+        // columns are stored that way too.
+        let cutoff = (Utc::now() - chrono::Duration::seconds(window_seconds)).to_rfc3339();
+
+        // One round-trip pulls everything we need:
+        //   - one aggregation query: per-target counts + last_success/last_failure
+        //   - one query for percentile computation (raw `attempts` over delivered rows in-window)
+        //   - one query for queue-level oldest_pending_age
+        // Done in a single `call` to keep the connection-pool usage low
+        // and so the snapshot is internally consistent (no torn reads
+        // across multiple awaits).
+        let snapshot = self
+            .conn
+            .call(move |conn| {
+                // Per-target rollup. SQL takes care of the simple counts;
+                // percentiles are done after-the-fact in Rust because
+                // SQLite's bundled build doesn't ship percentile_cont.
+                let mut rollup_stmt = conn.prepare(
+                    "SELECT \
+                        target_url, \
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending, \
+                        SUM(CASE WHEN status = 'delivered' AND delivered_at >= ?1 THEN 1 ELSE 0 END) AS delivered_recent, \
+                        SUM(CASE WHEN status = 'expired' AND last_attempt_at >= ?1 THEN 1 ELSE 0 END) AS expired_recent, \
+                        SUM(CASE WHEN status = 'superseded' AND last_attempt_at >= ?1 THEN 1 ELSE 0 END) AS superseded_recent, \
+                        MAX(CASE WHEN status = 'delivered' AND delivered_at >= ?1 THEN delivered_at END) AS last_success_at, \
+                        MAX(CASE WHEN status = 'expired' AND last_attempt_at >= ?1 THEN last_attempt_at END) AS last_failure_at \
+                     FROM outbound_deliveries \
+                     GROUP BY target_url \
+                     ORDER BY target_url",
+                )?;
+                let target_rows: Vec<(
+                    String,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    Option<String>,
+                    Option<String>,
+                )> = rollup_stmt
+                    .query_map(rusqlite::params![cutoff], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(rollup_stmt);
+
+                // Percentile inputs: per-target attempt counts for the
+                // delivered rows in-window. Sorted ASC so the percentile
+                // calculation in Rust is a direct index lookup.
+                let mut attempts_stmt = conn.prepare(
+                    "SELECT target_url, attempts FROM outbound_deliveries \
+                     WHERE status = 'delivered' AND delivered_at >= ?1 \
+                     ORDER BY target_url ASC, attempts ASC",
+                )?;
+                let attempt_rows: Vec<(String, i64)> = attempts_stmt
+                    .query_map(rusqlite::params![&cutoff], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(attempts_stmt);
+
+                // Queue-level totals + oldest_pending_age. Computed from
+                // the rollup so we don't double-scan.
+                let oldest_pending_at: Option<String> = conn
+                    .query_row(
+                        "SELECT MIN(created_at) FROM outbound_deliveries WHERE status = 'pending'",
+                        [],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+
+                Ok((target_rows, attempt_rows, oldest_pending_at))
+            })
+            .await?;
+
+        let (target_rows, attempt_rows, oldest_pending_at) = snapshot;
+
+        // Group attempt counts by target_url for percentile compute.
+        // attempt_rows is already sorted (target_url ASC, attempts ASC)
+        // so we can walk it linearly.
+        let mut attempts_by_target: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (target, n) in attempt_rows {
+            attempts_by_target
+                .entry(target)
+                .or_default()
+                .push(n.max(0) as u32);
+        }
+
+        let mut targets = Vec::with_capacity(target_rows.len());
+        let mut queue = QueueStats::default();
+        for (target_url, pending, delivered, expired, superseded, last_success, last_failure) in
+            target_rows
+        {
+            queue.pending += pending.max(0) as u64;
+            queue.delivered_recent += delivered.max(0) as u64;
+            queue.expired_recent += expired.max(0) as u64;
+            queue.superseded_recent += superseded.max(0) as u64;
+
+            let attempts = attempts_by_target
+                .get(&target_url)
+                .cloned()
+                .unwrap_or_default();
+            let p50 = percentile(&attempts, 50);
+            let p95 = percentile(&attempts, 95);
+
+            targets.push(TargetStats {
+                target_url,
+                pending: pending.max(0) as u64,
+                delivered_recent: delivered.max(0) as u64,
+                expired_recent: expired.max(0) as u64,
+                superseded_recent: superseded.max(0) as u64,
+                p50_attempts: p50,
+                p95_attempts: p95,
+                last_success_at: last_success,
+                last_failure_at: last_failure,
+            });
+        }
+
+        // Oldest pending age. Compute now-vs-oldest-row in seconds.
+        // Defensive: if the row's timestamp is in the future (clock
+        // skew) clamp to 0 rather than report a negative.
+        if let Some(ts) = oldest_pending_at {
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                let age = (Utc::now() - t.with_timezone(&Utc)).num_seconds();
+                queue.oldest_pending_age_seconds = Some(age.max(0));
+            }
+        }
+
+        Ok(FederationMetricsSnapshot { queue, targets })
+    }
+}
+
+/// Return the `p`-th percentile of a sorted-ascending slice of attempt
+/// counts using nearest-rank. Returns `0` for empty input — caller can
+/// treat that as "no data". Pure function so the storage tests can
+/// exercise edge cases without the SQLite roundtrip.
+fn percentile(sorted_asc: &[u32], p: u32) -> u32 {
+    if sorted_asc.is_empty() {
+        return 0;
+    }
+    let p = p.min(100) as usize;
+    // Nearest-rank: index = ceil(p/100 * n) - 1, clamped to [0, n-1].
+    let n = sorted_asc.len();
+    let idx = ((p * n + 99) / 100).saturating_sub(1).min(n - 1);
+    sorted_asc[idx]
 }
 
 fn escape_like(s: &str) -> String {
@@ -2094,8 +2321,8 @@ fn is_expired(envelope: &Envelope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimAliasOutcome, FileStore, LifecycleOutcome, ProvisionOutcome, SqliteStore, Store,
-        StoreOutcome,
+        percentile, ClaimAliasOutcome, FileStore, LifecycleOutcome, ProvisionOutcome, QueueStats,
+        SqliteStore, Store, StoreOutcome,
     };
     use crate::config::RetentionPolicy;
     use aegis_proto::{
@@ -3199,6 +3426,288 @@ mod tests {
         // Unknown id → None
         let missing = store.fetch_envelope_json("env-does-not-exist").await.unwrap();
         assert!(missing.is_none());
+    }
+
+    // --- Federation metrics (mlaify/aegis-relay#31) ----------------------
+
+    #[test]
+    fn percentile_handles_edge_cases() {
+        // Empty input → 0 (caller treats as "no data")
+        assert_eq!(percentile(&[], 50), 0);
+        // Single element: p* always returns it
+        assert_eq!(percentile(&[3], 0), 3);
+        assert_eq!(percentile(&[3], 50), 3);
+        assert_eq!(percentile(&[3], 95), 3);
+        // Standard nearest-rank semantics on a tidy list. n=7;
+        // p=50 → ceil(0.5 * 7) - 1 = 3 → sorted[3] = 2.
+        // p=95 → ceil(0.95 * 7) - 1 = 6 → sorted[6] = 7.
+        let sorted = [1, 1, 1, 2, 3, 5, 7];
+        assert_eq!(percentile(&sorted, 50), 2);
+        assert_eq!(percentile(&sorted, 95), 7);
+        // p > 100 clamps to 100 (which still yields the last element).
+        assert_eq!(percentile(&sorted, 200), 7);
+    }
+
+    #[tokio::test]
+    async fn federation_metrics_empty_queue_returns_zeros() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        let snap = store.federation_metrics(86_400).await.unwrap();
+        assert_eq!(snap.queue, QueueStats::default());
+        assert!(snap.targets.is_empty());
+        assert!(snap.queue.oldest_pending_age_seconds.is_none());
+    }
+
+    #[tokio::test]
+    async fn federation_metrics_aggregates_per_target() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        // Stash a real envelope so mark_delivery_delivered's
+        // envelope-purge step doesn't fail noisily.
+        let env = sample_envelope("amp:did:key:zMetricsRecipient");
+        let env_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        // Three targets, varied outcomes — designed to exercise every
+        // branch the SQL aggregator has:
+        //   peer-fast: delivered first try
+        //   peer-slow: delivered after 3 attempts (so p50 ≠ p95)
+        //   peer-down: 5xx-flavored — push expired
+        for target in ["https://peer-fast", "https://peer-slow", "https://peer-down"] {
+            store.enqueue_outbound_delivery(&env_id, target).await.unwrap();
+        }
+
+        // peer-slow took 3 attempts. Bump its attempts column to match
+        // (the trait's mark_delivery_attempt does this in production).
+        store
+            .conn
+            .call({
+                let env_id = env_id.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE outbound_deliveries SET attempts = 3 \
+                         WHERE envelope_id = ?1 AND target_url = ?2",
+                        rusqlite::params![env_id, "https://peer-slow"],
+                    )
+                    .map_err(|e| e.into())
+                }
+            })
+            .await
+            .unwrap();
+
+        // peer-fast wins → flips peer-slow + peer-down to 'superseded'
+        // by the supersede transaction. We don't want that for this
+        // test (we want delivered + expired in different rows for
+        // assertion variety), so bypass that path: directly mark
+        // peer-fast delivered FIRST without going through siblings,
+        // by using the public `mark_delivery_delivered` and accepting
+        // the supersede side-effect ... wait, let's instead drive
+        // each target into its terminal state with bypassing siblings.
+        //
+        // Approach: mark peer-down expired first, peer-slow delivered
+        // (its solo-target, no siblings to supersede), peer-fast
+        // delivered (also solo) — but they share envelope_id so
+        // that's not actually solo. Easiest: use FRESH envelope_ids
+        // per target.
+        store
+            .mark_delivery_expired(&env_id, "https://peer-down")
+            .await
+            .unwrap();
+
+        // Multiple delivered envelopes for peer-fast (drives delivered
+        // count up + p50/p95 stays at 1).
+        for i in 0..4 {
+            let mut env_i = sample_envelope("amp:did:key:zMetricsRecipient");
+            // Force a unique envelope_id per iteration (Envelope::new
+            // already does this via UUID so we just need to call it
+            // again — `sample_envelope` returns a fresh UUID).
+            env_i.envelope_id = aegis_proto::EnvelopeId(uuid::Uuid::new_v4());
+            let id = env_i.envelope_id.0.to_string();
+            store.store(&env_i).await.unwrap();
+            store
+                .enqueue_outbound_delivery(&id, "https://peer-fast")
+                .await
+                .unwrap();
+            store
+                .mark_delivery_delivered(&id, "https://peer-fast")
+                .await
+                .unwrap();
+            // peer-fast's `attempts` stays at 0 in storage; we want a
+            // realistic 1 to model "delivered first try".
+            store
+                .conn
+                .call({
+                    let id = id.clone();
+                    move |conn| {
+                        conn.execute(
+                            "UPDATE outbound_deliveries SET attempts = 1 \
+                             WHERE envelope_id = ?1 AND target_url = ?2",
+                            rusqlite::params![id, "https://peer-fast"],
+                        )
+                        .map_err(|e| e.into())
+                    }
+                })
+                .await
+                .unwrap();
+            // Drop the iteration counter from rustfmt's notice.
+            let _ = i;
+        }
+
+        // peer-slow: deliver one envelope after 3 attempts.
+        let mut slow_env = sample_envelope("amp:did:key:zMetricsRecipient");
+        slow_env.envelope_id = aegis_proto::EnvelopeId(uuid::Uuid::new_v4());
+        let slow_id = slow_env.envelope_id.0.to_string();
+        store.store(&slow_env).await.unwrap();
+        store
+            .enqueue_outbound_delivery(&slow_id, "https://peer-slow-2")
+            .await
+            .unwrap();
+        store
+            .mark_delivery_delivered(&slow_id, "https://peer-slow-2")
+            .await
+            .unwrap();
+        store
+            .conn
+            .call({
+                let id = slow_id.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE outbound_deliveries SET attempts = 4 \
+                         WHERE envelope_id = ?1 AND target_url = ?2",
+                        rusqlite::params![id, "https://peer-slow-2"],
+                    )
+                    .map_err(|e| e.into())
+                }
+            })
+            .await
+            .unwrap();
+
+        // Window covering everything we just inserted.
+        let snap = store.federation_metrics(86_400).await.unwrap();
+
+        // Targets are returned alphabetically (ORDER BY target_url).
+        let target_urls: Vec<&str> = snap.targets.iter().map(|t| t.target_url.as_str()).collect();
+        assert!(
+            target_urls.contains(&"https://peer-down"),
+            "expected peer-down in {:?}",
+            target_urls
+        );
+        assert!(target_urls.contains(&"https://peer-fast"));
+        assert!(target_urls.contains(&"https://peer-slow-2"));
+
+        let fast = snap.targets.iter().find(|t| t.target_url == "https://peer-fast").unwrap();
+        assert_eq!(fast.delivered_recent, 4);
+        assert_eq!(fast.expired_recent, 0);
+        assert_eq!(fast.p50_attempts, 1);
+        assert_eq!(fast.p95_attempts, 1);
+        assert!(fast.last_success_at.is_some());
+
+        let slow = snap.targets.iter().find(|t| t.target_url == "https://peer-slow-2").unwrap();
+        assert_eq!(slow.delivered_recent, 1);
+        assert_eq!(slow.p50_attempts, 4);
+
+        let down = snap.targets.iter().find(|t| t.target_url == "https://peer-down").unwrap();
+        assert_eq!(down.expired_recent, 1);
+        assert_eq!(down.delivered_recent, 0);
+        assert!(down.last_failure_at.is_some());
+
+        // Queue rollup sums over all three targets.
+        assert_eq!(snap.queue.delivered_recent, 5);
+        assert_eq!(snap.queue.expired_recent, 1);
+    }
+
+    #[tokio::test]
+    async fn federation_metrics_window_excludes_old_rows() {
+        // A row delivered well before the window cutoff must NOT count
+        // toward `delivered_recent`. We simulate "old" by stamping a
+        // delivered_at in the past directly via SQL.
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        let env = sample_envelope("amp:did:key:zWindowRecipient");
+        let env_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+        store
+            .enqueue_outbound_delivery(&env_id, "https://stale.example")
+            .await
+            .unwrap();
+        store
+            .mark_delivery_delivered(&env_id, "https://stale.example")
+            .await
+            .unwrap();
+
+        // Backdate this row's delivered_at + last_attempt_at by 7 days
+        // so a 24h window ignores it.
+        let week_ago = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        store
+            .conn
+            .call({
+                let env_id = env_id.clone();
+                let stamp = week_ago.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE outbound_deliveries SET delivered_at = ?1, last_attempt_at = ?1 \
+                         WHERE envelope_id = ?2",
+                        rusqlite::params![stamp, env_id],
+                    )
+                    .map_err(|e| e.into())
+                }
+            })
+            .await
+            .unwrap();
+
+        let day = store.federation_metrics(86_400).await.unwrap();
+        let stale = day.targets.iter().find(|t| t.target_url == "https://stale.example");
+        // Either the target row is absent (no in-window activity at all
+        // and aggregator returns the row but with all zeros) or its
+        // delivered_recent is 0. Either way must NOT be counted.
+        match stale {
+            None => {
+                // Acceptable — could happen if status filter excluded it.
+            }
+            Some(t) => {
+                assert_eq!(t.delivered_recent, 0);
+            }
+        }
+
+        // Widening the window to 30d picks it up again.
+        let month = store.federation_metrics(30 * 86_400).await.unwrap();
+        let stale_30d = month
+            .targets
+            .iter()
+            .find(|t| t.target_url == "https://stale.example")
+            .expect("target row appears in widened window");
+        assert_eq!(stale_30d.delivered_recent, 1);
+    }
+
+    #[tokio::test]
+    async fn federation_metrics_oldest_pending_age_reports_seconds() {
+        let store = SqliteStore::open_in_memory().await.expect("sqlite");
+        // Empty queue → no oldest age reported.
+        let empty = store.federation_metrics(86_400).await.unwrap();
+        assert!(empty.queue.oldest_pending_age_seconds.is_none());
+
+        // Enqueue a row, backdate created_at by 5 minutes.
+        store
+            .enqueue_outbound_delivery("env-old", "https://peer.example")
+            .await
+            .unwrap();
+        let five_min_ago = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        store
+            .conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE outbound_deliveries SET created_at = ?1 WHERE envelope_id = 'env-old'",
+                    rusqlite::params![five_min_ago],
+                )
+                .map_err(|e| e.into())
+            })
+            .await
+            .unwrap();
+
+        let snap = store.federation_metrics(86_400).await.unwrap();
+        let age = snap.queue.oldest_pending_age_seconds.expect("age present");
+        assert!(
+            age >= 5 * 60 - 5 && age <= 5 * 60 + 5,
+            "expected ~300s, got {age}"
+        );
+        assert_eq!(snap.queue.pending, 1);
     }
 
     #[tokio::test]
