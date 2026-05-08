@@ -119,6 +119,10 @@ async fn main() {
         .route("/admin/identities", get(admin_routes::admin_list_identities))
         .route("/admin/audit", get(admin_routes::admin_audit_log))
         .route(
+            "/admin/federation/metrics",
+            get(admin_routes::admin_federation_metrics),
+        )
+        .route(
             "/admin/domains",
             get(admin_routes::admin_list_domains).post(admin_routes::admin_claim_domain),
         )

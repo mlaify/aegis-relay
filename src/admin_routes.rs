@@ -432,6 +432,117 @@ pub async fn admin_list_identities(
     }
 }
 
+// --- Federation metrics (mlaify/aegis-relay#31) ----------------------------
+
+/// Default sliding window when callers don't pass `?window_seconds=`.
+/// 24h matches the dashboard's "last day" framing and the typical
+/// retention story for audit-style data.
+const DEFAULT_FEDERATION_METRICS_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Cap how far back operators can ask the metrics endpoint to look.
+/// Aggregations are O(n) over the queue table; if someone asks for a
+/// 30-day window on a busy relay we'd rather trim than melt the DB.
+const MAX_FEDERATION_METRICS_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+
+#[derive(Debug, Deserialize)]
+pub struct FederationMetricsParams {
+    /// Sliding window for the `_recent` rollups, in seconds. Optional;
+    /// defaults to 24h and capped at 30d to bound query cost.
+    #[serde(default)]
+    pub window_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FederationMetricsResponse {
+    /// The window (in seconds) the `_recent` numbers below cover.
+    /// Echoed back so the SPA can render "last 24h" / "last 6h" /
+    /// whatever the operator actually got.
+    pub window_seconds: i64,
+    pub queue: FederationQueueResponse,
+    pub targets: Vec<FederationTargetResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FederationQueueResponse {
+    pub pending: u64,
+    pub delivered_recent: u64,
+    pub expired_recent: u64,
+    pub superseded_recent: u64,
+    pub oldest_pending_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FederationTargetResponse {
+    pub target_url: String,
+    pub pending: u64,
+    pub delivered_recent: u64,
+    pub expired_recent: u64,
+    pub superseded_recent: u64,
+    pub p50_attempts: u32,
+    pub p95_attempts: u32,
+    pub last_success_at: Option<String>,
+    pub last_failure_at: Option<String>,
+}
+
+/// Clamp a caller-supplied window (or the default) to the supported
+/// range. Pulled out so unit tests can exercise the boundary logic
+/// without spinning up a router.
+fn clamp_metrics_window(raw: Option<i64>) -> i64 {
+    let n = raw.unwrap_or(DEFAULT_FEDERATION_METRICS_WINDOW_SECS);
+    n.clamp(60, MAX_FEDERATION_METRICS_WINDOW_SECS)
+}
+
+pub async fn admin_federation_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<FederationMetricsParams>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+
+    let window = clamp_metrics_window(params.window_seconds);
+
+    let snapshot = match state.store.federation_metrics(window).await {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": { "code": "storage_error", "message": "failed to compute federation metrics" } })),
+            )
+                .into_response()
+        }
+    };
+
+    let body = FederationMetricsResponse {
+        window_seconds: window,
+        queue: FederationQueueResponse {
+            pending: snapshot.queue.pending,
+            delivered_recent: snapshot.queue.delivered_recent,
+            expired_recent: snapshot.queue.expired_recent,
+            superseded_recent: snapshot.queue.superseded_recent,
+            oldest_pending_age_seconds: snapshot.queue.oldest_pending_age_seconds,
+        },
+        targets: snapshot
+            .targets
+            .into_iter()
+            .map(|t| FederationTargetResponse {
+                target_url: t.target_url,
+                pending: t.pending,
+                delivered_recent: t.delivered_recent,
+                expired_recent: t.expired_recent,
+                superseded_recent: t.superseded_recent,
+                p50_attempts: t.p50_attempts,
+                p95_attempts: t.p95_attempts,
+                last_success_at: t.last_success_at,
+                last_failure_at: t.last_failure_at,
+            })
+            .collect(),
+    };
+
+    Json(body).into_response()
+}
+
 pub async fn admin_audit_log(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1123,5 +1234,47 @@ mod tests {
         // attempts stays pinned at 1 regardless of the env timeout —
         // operators don't get to dial up retries on this code path.
         assert_eq!(opts.attempts, 1);
+    }
+
+    // --- Federation metrics window clamping (mlaify/aegis-relay#31) ----
+
+    #[test]
+    fn clamp_metrics_window_default_is_24h() {
+        assert_eq!(
+            clamp_metrics_window(None),
+            DEFAULT_FEDERATION_METRICS_WINDOW_SECS
+        );
+    }
+
+    #[test]
+    fn clamp_metrics_window_passes_through_reasonable_values() {
+        // 1h, 6h, 7d all fall inside [60, 30d] so they round-trip.
+        assert_eq!(clamp_metrics_window(Some(60 * 60)), 3600);
+        assert_eq!(clamp_metrics_window(Some(6 * 60 * 60)), 21_600);
+        assert_eq!(clamp_metrics_window(Some(7 * 24 * 60 * 60)), 604_800);
+    }
+
+    #[test]
+    fn clamp_metrics_window_floor_protects_against_zero_or_negative() {
+        // Querying with window=0 would produce a nonsensical "in the
+        // future" cutoff. Floor at 60s — any aggregation worth doing
+        // covers at least a minute.
+        assert_eq!(clamp_metrics_window(Some(0)), 60);
+        assert_eq!(clamp_metrics_window(Some(-1)), 60);
+        assert_eq!(clamp_metrics_window(Some(30)), 60);
+    }
+
+    #[test]
+    fn clamp_metrics_window_caps_at_thirty_days() {
+        // 90d → clamped to 30d. Bounds the SQL aggregation cost so a
+        // curious operator can't accidentally tablescan months of data.
+        assert_eq!(
+            clamp_metrics_window(Some(90 * 24 * 60 * 60)),
+            MAX_FEDERATION_METRICS_WINDOW_SECS
+        );
+        assert_eq!(
+            clamp_metrics_window(Some(i64::MAX)),
+            MAX_FEDERATION_METRICS_WINDOW_SECS
+        );
     }
 }
