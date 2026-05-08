@@ -271,6 +271,10 @@ mod tests {
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: None,
             relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
+            federation_discovery_cache: Arc::new(
+                crate::federation_verify::DiscoveryCache::default_ttl(),
+            ),
+            federation_trusted_peers: None,
         });
         let app = Router::new()
             .route(
@@ -524,6 +528,10 @@ mod tests {
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: None,
             relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
+            federation_discovery_cache: Arc::new(
+                crate::federation_verify::DiscoveryCache::default_ttl(),
+            ),
+            federation_trusted_peers: None,
         });
         let app: Router = Router::new()
             .route(
