@@ -4,6 +4,17 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### Phase 6 federation — part 3: optional sender-side mTLS (closes #32)
+
+- New env vars (all optional):
+  - `AEGIS_FEDERATION_CLIENT_CERT_PATH` — path to client cert PEM
+  - `AEGIS_FEDERATION_CLIENT_KEY_PATH` — path to private key PEM
+  - `AEGIS_FEDERATION_CA_BUNDLE_PATH` — path to custom CA bundle PEM (for verifying peer TLS certs against a private CA)
+- New `federation::build_http_client_with` helper (pure function, env-var injection so tests can drive without `set_var` racing) + `build_http_client_from_env` wrapper used by the boot path
+- New `FederationClientError` enum (`IncompleteMtlsConfig`, `PemRead`, `PemDecode`, `Reqwest`) — fail loud at startup if mTLS is half-configured (cert without key or vice-versa) rather than silently downgrade to anonymous federation
+- 7 new tests cover env-var combinations, missing files, malformed PEM, CA-without-mTLS, and PEM concatenation edge cases
+- Receiver-side mTLS deliberately not in code — operator handles via CF Access mTLS for tunneled deployments or their reverse proxy elsewhere; documented in mlaify/aegis-deploy `.env.example`
+
 ### v0.3.0-alpha — phase 1 (relay-side prekey enforcement)
 
 - New `consumed_prekeys` SQLite table with `PRIMARY KEY (recipient_id, key_id)` records every consumed one-time prekey
