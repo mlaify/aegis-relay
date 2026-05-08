@@ -3,6 +3,7 @@ mod audit;
 mod config;
 mod discovery;
 mod federation;
+mod federation_verify;
 mod identity_routes;
 mod prekey_routes;
 mod prometheus;
@@ -33,6 +34,17 @@ pub struct AppState {
     /// Wrapped in `Arc` so the federation handler can clone the
     /// `AppState` cheaply across spawned tasks.
     pub relay_identity: Arc<storage::RelayIdentity>,
+    /// Cache of peer relays' discovery documents (#32 part 2).
+    /// Populated lazily by the federation worker on first contact +
+    /// after every TTL expiry. Used to verify delivery receipts
+    /// against the peer's published signing keys.
+    pub federation_discovery_cache: Arc<federation_verify::DiscoveryCache>,
+    /// Optional trusted-peer allowlist (#32 part 2). When `Some`,
+    /// federation deliveries to peers whose published `relay_id`
+    /// isn't in the list fail pre-flight without ever pushing the
+    /// envelope. `None` (the default) preserves the open-federation
+    /// behavior shipped in #29.
+    pub federation_trusted_peers: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -86,6 +98,21 @@ async fn main() {
         }
     };
 
+    // #32 part 2: peer discovery cache + optional trusted-peer allowlist.
+    // Cache uses the default 5-minute TTL; can be tightened by editing
+    // `federation_verify::DiscoveryCache::default_ttl()` if operators
+    // need faster key-rotation propagation. Allowlist is `None` unless
+    // the operator opted into strict federation via env var.
+    let federation_discovery_cache =
+        Arc::new(federation_verify::DiscoveryCache::default_ttl());
+    let federation_trusted_peers = federation_verify::trusted_peers_from_env();
+    if let Some(peers) = &federation_trusted_peers {
+        tracing::info!(
+            count = peers.len(),
+            "federation trusted-peer allowlist active; deliveries to other peers will fail pre-flight"
+        );
+    }
+
     let state = Arc::new(AppState {
         store: store_arc,
         runtime,
@@ -94,6 +121,8 @@ async fn main() {
         runtime_config_path,
         public_url,
         relay_identity: Arc::new(relay_identity),
+        federation_discovery_cache,
+        federation_trusted_peers,
     });
 
     // Phase 5 (#28): start the federation delivery worker. Off by default
@@ -164,6 +193,10 @@ async fn main() {
         .route(
             "/admin/federation/metrics",
             get(admin_routes::admin_federation_metrics),
+        )
+        .route(
+            "/admin/deliveries/:envelope_id",
+            get(admin_routes::admin_deliveries_for_envelope),
         )
         .route(
             "/admin/domains",

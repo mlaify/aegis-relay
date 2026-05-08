@@ -432,6 +432,78 @@ pub async fn admin_list_identities(
     }
 }
 
+// --- Per-envelope delivery forensics (mlaify/aegis-relay#32) ---------------
+
+#[derive(Debug, Serialize)]
+pub struct DeliveryRecordResponse {
+    pub envelope_id: String,
+    pub target_url: String,
+    pub status: String,
+    pub attempts: u32,
+    pub next_retry_at: String,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
+    /// Signed `DeliveryReceipt` JSON the peer returned, if any. Older
+    /// peers (no #32 part 1) won't have one even on success.
+    pub receipt: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeliveriesForEnvelopeResponse {
+    pub envelope_id: String,
+    pub items: Vec<DeliveryRecordResponse>,
+}
+
+/// `GET /admin/deliveries/:envelope_id` — operator forensics for a
+/// single envelope's federation history. Returns one row per
+/// (envelope, target) tuple with the full lifecycle: status, attempts,
+/// timestamps, last error, signed receipt (if the peer returned one
+/// and it verified). Multi-target envelopes (#30) show all siblings;
+/// `superseded` rows reveal which target won the race.
+pub async fn admin_deliveries_for_envelope(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(envelope_id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+
+    match state.store.list_deliveries_for_envelope(&envelope_id).await {
+        Ok(rows) => {
+            let items = rows
+                .into_iter()
+                .map(|r| DeliveryRecordResponse {
+                    envelope_id: r.envelope_id,
+                    target_url: r.target_url,
+                    status: r.status,
+                    attempts: r.attempts,
+                    next_retry_at: r.next_retry_at,
+                    last_error: r.last_error,
+                    last_attempt_at: r.last_attempt_at,
+                    created_at: r.created_at,
+                    delivered_at: r.delivered_at,
+                    // Parse the receipt JSON so the response is a
+                    // single typed object instead of a quoted string.
+                    // Garbage stored in the column shouldn't take down
+                    // the endpoint — fall back to the raw string.
+                    receipt: r.receipt_json.as_deref().map(|s| {
+                        serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.to_string()))
+                    }),
+                })
+                .collect();
+            Json(DeliveriesForEnvelopeResponse { envelope_id, items }).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": { "code": "storage_error", "message": "failed to list deliveries" } })),
+        )
+            .into_response(),
+    }
+}
+
 // --- Federation metrics (mlaify/aegis-relay#31) ----------------------------
 
 /// Default sliding window when callers don't pass `?window_seconds=`.

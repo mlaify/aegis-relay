@@ -235,6 +235,110 @@ pub(crate) async fn deliver_one(
     max_attempts: u32,
     delivery: &crate::storage::OutboundDelivery,
 ) {
+    // Phase 6 (#32 part 2): pre-flight peer trust check. Fetch the
+    // peer's discovery doc (cached), confirm we can read a hybrid
+    // signing identity from it, then enforce the trusted-peer
+    // allowlist if one is configured. Failures here mark the row
+    // expired without ever sending the envelope — the operator's
+    // explicit "I don't trust this peer" decision must short-circuit
+    // before any data leaves the host.
+    let peer_doc = match crate::federation_verify::fetch_peer_identity(
+        &state.federation_discovery_cache,
+        client,
+        &delivery.target_url,
+    )
+    .await
+    {
+        Ok(doc) => Some(doc),
+        Err(crate::federation_verify::FederationVerifyError::PeerHasNoIdentity) => {
+            // Peer is on an older version (#32 part 1 not deployed
+            // there yet). We have to choose: refuse, or push without
+            // verification. v0 chooses "push without verification" so
+            // graceful upgrade across the fleet is possible — the
+            // sender stores no receipt for this delivery, surfaces
+            // that fact in audit log + metrics. If an operator has
+            // configured the allowlist, we DO refuse below because
+            // we can't confirm peer identity to enforce the list.
+            if state.federation_trusted_peers.is_some() {
+                let detail = format!(
+                    "peer {} has no relay_identity in /.well-known/aegis-config; \
+                     cannot enforce AEGIS_FEDERATION_TRUSTED_PEERS",
+                    delivery.target_url
+                );
+                tracing::warn!(target: "federation", envelope_id = %delivery.envelope_id, "{}", detail);
+                state
+                    .audit
+                    .record(crate::audit::AuditEvent {
+                        at: Utc::now(),
+                        operation: "federation_expired",
+                        outcome: "untrusted_peer",
+                        recipient_id: None,
+                        envelope_id: Some(&delivery.envelope_id),
+                        identity_id: None,
+                        detail: Some(&detail),
+                    })
+                    .await;
+                let _ = state
+                    .store
+                    .mark_delivery_expired(&delivery.envelope_id, &delivery.target_url)
+                    .await;
+                return;
+            }
+            None
+        }
+        Err(e) => {
+            // Discovery fetch failed — transient by default (DNS,
+            // network), retry with backoff. The sender doesn't
+            // distinguish "peer is down" from "peer is misconfigured"
+            // here; both end up in the retry schedule.
+            tracing::warn!(
+                target: "federation",
+                error = %e,
+                target_url = %delivery.target_url,
+                "discovery fetch failed; will retry"
+            );
+            schedule_retry(state, max_attempts, delivery, &format!("discovery: {}", e)).await;
+            return;
+        }
+    };
+
+    // Allowlist check. Skipped only when the peer has no identity
+    // AND the operator hasn't asked for strict federation (handled
+    // above — we returned early when `trusted_peers.is_some()` and the
+    // peer had no identity).
+    if let Some(doc) = &peer_doc {
+        let allowlist = state.federation_trusted_peers.as_deref();
+        if !crate::federation_verify::is_peer_trusted(allowlist, &doc.identity_id.0) {
+            let detail = format!(
+                "peer {} (id={}) is not in AEGIS_FEDERATION_TRUSTED_PEERS",
+                delivery.target_url, doc.identity_id.0
+            );
+            tracing::warn!(
+                target: "federation",
+                envelope_id = %delivery.envelope_id,
+                "{}",
+                detail
+            );
+            state
+                .audit
+                .record(crate::audit::AuditEvent {
+                    at: Utc::now(),
+                    operation: "federation_expired",
+                    outcome: "untrusted_peer",
+                    recipient_id: None,
+                    envelope_id: Some(&delivery.envelope_id),
+                    identity_id: None,
+                    detail: Some(&detail),
+                })
+                .await;
+            let _ = state
+                .store
+                .mark_delivery_expired(&delivery.envelope_id, &delivery.target_url)
+                .await;
+            return;
+        }
+    }
+
     // Reload the envelope from local storage so we forward the EXACT
     // bytes the sender pushed (signature canonicalization is byte-
     // sensitive). If the envelope is gone (already delivered + expired,
@@ -331,6 +435,78 @@ pub(crate) async fn deliver_one(
                 })
                 .await;
             if let Some(rj) = &receipt_json {
+                // Phase 6 (#32 part 2): verify the receipt against the
+                // peer's published signing keys before persisting.
+                // Verification failures invalidate the discovery cache
+                // (so the next attempt re-fetches and picks up any
+                // legitimate key rotation) and mark the row as
+                // expired — the peer claimed acceptance but couldn't
+                // prove it, which is a security event the operator
+                // should investigate.
+                if let Some(doc) = &peer_doc {
+                    match serde_json::from_str::<crate::relay_identity::DeliveryReceipt>(rj)
+                        .map_err(|e| crate::federation_verify::FederationVerifyError::CanonicalEncode(e.to_string()))
+                        .and_then(|r| crate::federation_verify::verify_receipt(&r, doc))
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                target: "federation",
+                                envelope_id = %delivery.envelope_id,
+                                target = %delivery.target_url,
+                                "receipt verified"
+                            );
+                            state
+                                .audit
+                                .record(crate::audit::AuditEvent {
+                                    at: Utc::now(),
+                                    operation: "federation_receipt_verified",
+                                    outcome: "ok",
+                                    recipient_id: None,
+                                    envelope_id: Some(&delivery.envelope_id),
+                                    identity_id: None,
+                                    detail: Some(&delivery.target_url),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            // Don't trust this peer for the next round;
+                            // forces a discovery re-fetch.
+                            state
+                                .federation_discovery_cache
+                                .invalidate(&delivery.target_url);
+                            let detail = format!(
+                                "{} verify_failed={}",
+                                delivery.target_url, e
+                            );
+                            tracing::warn!(
+                                target: "federation",
+                                envelope_id = %delivery.envelope_id,
+                                "receipt verification failed: {}",
+                                e
+                            );
+                            state
+                                .audit
+                                .record(crate::audit::AuditEvent {
+                                    at: Utc::now(),
+                                    operation: "federation_receipt_verify_failed",
+                                    outcome: "rejected",
+                                    recipient_id: None,
+                                    envelope_id: Some(&delivery.envelope_id),
+                                    identity_id: None,
+                                    detail: Some(&detail),
+                                })
+                                .await;
+                            let _ = state
+                                .store
+                                .mark_delivery_expired(
+                                    &delivery.envelope_id,
+                                    &delivery.target_url,
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                }
                 if let Err(e) = state
                     .store
                     .save_delivery_receipt(&delivery.envelope_id, &delivery.target_url, rj)
@@ -648,6 +824,10 @@ mod tests {
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url,
             relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
+            federation_discovery_cache: Arc::new(
+                crate::federation_verify::DiscoveryCache::default_ttl(),
+            ),
+            federation_trusted_peers: None,
         })
     }
 
@@ -1170,6 +1350,300 @@ mod tests {
         // Local envelope must NOT be deleted on a transient failure.
         let local = store.fetch_envelope_json(&envelope_id).await.unwrap();
         assert!(local.is_some(), "envelope must persist across retries");
+    }
+
+    /// Build a mini "peer relay" that serves both the discovery doc
+    /// (with the peer's identity_id and signing keys) AND
+    /// `POST /v1/envelopes` returning a properly-signed receipt.
+    /// Used by the #32 part 2 end-to-end tests so they exercise the
+    /// real verify path without standing up a full second relay.
+    async fn spawn_authentic_peer() -> (
+        String,
+        crate::storage::RelayIdentity,
+        Recorder,
+    ) {
+        let identity = crate::relay_identity::generate().expect("peer identity");
+        let identity_for_router = identity.clone();
+        let recorder: Recorder = Arc::new(Mutex::new(Vec::new()));
+        let recorder_for_router = recorder.clone();
+
+        // /.well-known/aegis-config → relay_identity-bearing doc.
+        let identity_for_discovery = identity.clone();
+        let discovery_handler = move || {
+            let doc = crate::relay_identity::public_document(&identity_for_discovery)
+                .expect("public doc");
+            async move {
+                axum::Json(serde_json::json!({
+                    "version": 1,
+                    "domain": "",
+                    "relay_url": "",
+                    "supported_suites": ["AMP-PQ-1"],
+                    "policy": {
+                        "registration": "open",
+                        "require_token_for_push": false,
+                        "require_token_for_identity_put": false,
+                    },
+                    "relay_identity": doc,
+                }))
+            }
+        };
+
+        // /v1/envelopes → 200 OK with a real signed receipt.
+        let envelope_handler = move |State(rec): State<(Recorder, crate::storage::RelayIdentity)>,
+                                     headers: HeaderMap,
+                                     Json(req): Json<StoreEnvelopeRequest>| async move {
+            let forwarded = headers
+                .get(FORWARDED_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            rec.0.lock().unwrap().push(RecordedRequest {
+                forwarded_header: forwarded,
+                envelope_id: req.envelope.envelope_id.0.to_string(),
+                recipient_id: req.envelope.recipient_id.0.clone(),
+            });
+            let received_at = chrono::Utc::now().to_rfc3339();
+            let receipt = crate::relay_identity::sign_receipt(
+                &rec.1,
+                &req.envelope.envelope_id.0.to_string(),
+                &received_at,
+            )
+            .expect("sign receipt");
+            Json(serde_json::json!({
+                "accepted": true,
+                "relay_id": rec.1.identity_id,
+                "receipt": receipt,
+            }))
+        };
+
+        let envelope_state = (recorder_for_router, identity_for_router.clone());
+        let app = Router::new()
+            .route("/.well-known/aegis-config", axum::routing::get(discovery_handler))
+            .route(
+                "/v1/envelopes",
+                post(envelope_handler).with_state(envelope_state),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), identity, recorder)
+    }
+
+    #[tokio::test]
+    async fn delivery_to_authentic_peer_verifies_and_persists_receipt() {
+        // End-to-end #32 part 2: sender pushes envelope, peer returns
+        // a real signed receipt, sender's worker fetches peer's
+        // discovery doc + verifies the signature + persists the
+        // receipt blob. The whole flow runs in-process against a
+        // local axum mock peer.
+        let (peer_url, _peer_identity, peer_recorder) = spawn_authentic_peer().await;
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zReceiptVerifyRecipient";
+        store
+            .store_identity(&sample_identity_doc(recipient, vec![peer_url.clone()]))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+
+        // Peer received the POST.
+        let recv = peer_recorder.lock().unwrap();
+        assert_eq!(recv.len(), 1);
+        drop(recv);
+
+        // Local envelope purged (delivery succeeded).
+        assert!(store.fetch_envelope_json(&envelope_id).await.unwrap().is_none());
+
+        // Receipt persisted in outbound_deliveries.
+        let rows = store.list_deliveries_for_envelope(&envelope_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "delivered");
+        assert!(
+            rows[0].receipt_json.is_some(),
+            "verified receipt should be persisted"
+        );
+        // It's well-formed JSON describing a DeliveryReceipt.
+        let receipt: serde_json::Value =
+            serde_json::from_str(rows[0].receipt_json.as_ref().unwrap()).unwrap();
+        assert_eq!(receipt["envelope_id"], envelope_id);
+        assert!(receipt["signature"].as_str().unwrap().starts_with("ed25519:"));
+    }
+
+    #[tokio::test]
+    async fn delivery_refused_when_peer_not_in_allowlist() {
+        // Operator has set AEGIS_FEDERATION_TRUSTED_PEERS. The peer
+        // serves a valid discovery doc with its own identity_id, but
+        // it's NOT in our allowlist. The sender must refuse pre-flight
+        // and never push the envelope.
+        let (peer_url, _peer_identity, peer_recorder) = spawn_authentic_peer().await;
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zAllowlistRecipient";
+        store
+            .store_identity(&sample_identity_doc(recipient, vec![peer_url.clone()]))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let mut state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        // SAFETY: state is the only Arc; no other clones yet.
+        let mutable = Arc::get_mut(&mut state).expect("unique Arc");
+        mutable.federation_trusted_peers =
+            Some(vec!["amp:did:key:zNotThisPeer".to_string()]);
+        let state = state;
+
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+
+        // Peer received NO POST — refusal happened pre-flight.
+        let recv = peer_recorder.lock().unwrap();
+        assert_eq!(recv.len(), 0, "allowlist refusal should never push");
+        drop(recv);
+
+        // Row marked expired with no further retries.
+        let rows = store.list_deliveries_for_envelope(&envelope_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "expired");
+    }
+
+    #[tokio::test]
+    async fn delivery_marks_expired_when_receipt_verification_fails() {
+        // Peer is reachable + serves discovery, but its receipt is
+        // forged (signed by someone else). Sender should detect the
+        // mismatch, invalidate cache, and mark the row expired.
+        // Mock returns a "receipt" object whose signature won't
+        // verify against the doc the discovery endpoint published.
+
+        let bogus_identity = crate::relay_identity::generate().expect("bogus");
+        let advertised_identity = crate::relay_identity::generate().expect("advertised");
+
+        let recorder: Recorder = Arc::new(Mutex::new(Vec::new()));
+        let recorder_for_route = recorder.clone();
+
+        // /.well-known/aegis-config → advertised_identity
+        let advertised_for_disc = advertised_identity.clone();
+        let discovery = move || {
+            let doc = crate::relay_identity::public_document(&advertised_for_disc).unwrap();
+            async move {
+                axum::Json(serde_json::json!({
+                    "version": 1,
+                    "domain": "",
+                    "relay_url": "",
+                    "supported_suites": ["AMP-PQ-1"],
+                    "policy": {
+                        "registration": "open",
+                        "require_token_for_push": false,
+                        "require_token_for_identity_put": false,
+                    },
+                    "relay_identity": doc,
+                }))
+            }
+        };
+
+        // /v1/envelopes → returns a receipt SIGNED BY bogus_identity
+        // but claiming to be from advertised_identity. Classic forge.
+        let envelope_handler = move |State((rec, bogus, advertised)): State<(
+            Recorder,
+            crate::storage::RelayIdentity,
+            crate::storage::RelayIdentity,
+        )>,
+                                     headers: HeaderMap,
+                                     Json(req): Json<StoreEnvelopeRequest>| async move {
+            let forwarded = headers
+                .get(FORWARDED_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            rec.lock().unwrap().push(RecordedRequest {
+                forwarded_header: forwarded,
+                envelope_id: req.envelope.envelope_id.0.to_string(),
+                recipient_id: req.envelope.recipient_id.0.clone(),
+            });
+            // Sign with bogus identity but claim to be `advertised`.
+            let mut receipt = crate::relay_identity::sign_receipt(
+                &bogus,
+                &req.envelope.envelope_id.0.to_string(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+            receipt.receiver_relay_id = advertised.identity_id.clone();
+            Json(serde_json::json!({
+                "accepted": true,
+                "relay_id": advertised.identity_id,
+                "receipt": receipt,
+            }))
+        };
+
+        let env_state = (
+            recorder_for_route,
+            bogus_identity,
+            advertised_identity.clone(),
+        );
+        let app = Router::new()
+            .route("/.well-known/aegis-config", axum::routing::get(discovery))
+            .route("/v1/envelopes", post(envelope_handler).with_state(env_state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let recipient = "amp:did:key:zForgedRecipient";
+        store
+            .store_identity(&sample_identity_doc(recipient, vec![peer_url.clone()]))
+            .await
+            .unwrap();
+        let env = sample_envelope_for(recipient);
+        let envelope_id = env.envelope_id.0.to_string();
+        store.store(&env).await.unwrap();
+
+        let state = make_state(Some("https://us.example".to_string()), store.clone()).await;
+        maybe_enqueue(&state, &envelope_id, recipient).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let due = store.next_pending_delivery().await.unwrap().unwrap();
+        deliver_one(&state, &client, DEFAULT_MAX_ATTEMPTS, &due).await;
+
+        // Peer received the POST — refusal happens AFTER it returns
+        // the forged receipt, not before.
+        let recv = recorder.lock().unwrap();
+        assert_eq!(recv.len(), 1);
+        drop(recv);
+
+        // Verification failed → row is expired, NOT delivered.
+        let rows = store.list_deliveries_for_envelope(&envelope_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "expired",
+            "forged receipt should expire the delivery, got {:?}",
+            rows[0]
+        );
+        // Receipt was NOT persisted — we don't keep evidence of forgery.
+        assert!(rows[0].receipt_json.is_none());
     }
 
     #[tokio::test]

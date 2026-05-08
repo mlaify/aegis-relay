@@ -22,6 +22,10 @@ use crate::AppState;
 #[derive(Debug, Serialize)]
 pub struct DiscoveryDocument {
     pub version: u8,
+    /// Empty when no domains are claimed (relay is in open mode,
+    /// receipts-only). Older clients that always read this field
+    /// see "" rather than failing, which is a softer degradation
+    /// than 404'ing the whole doc.
     pub domain: String,
     pub relay_url: String,
     pub supported_suites: Vec<&'static str>,
@@ -66,24 +70,39 @@ pub async fn well_known_aegis_config(
 
     let verified: Vec<_> = domains.into_iter().filter(|d| d.verified_at.is_some()).collect();
 
+    // Parse the persisted relay identity (signed at boot) and
+    // expose its public document. Always present — every relay
+    // generates one on first boot per #32 part 1. We swallow parse
+    // failures rather than fail the whole discovery doc.
+    let relay_identity_doc = crate::relay_identity::public_document(&state.relay_identity).ok();
+
+    let host_lower = host_header.split(':').next().unwrap_or("").to_ascii_lowercase();
+    let rt = state.runtime.read().unwrap();
+
     if verified.is_empty() {
-        // Open-relay mode: nothing to advertise.
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "no_discovery",
-                    "message": "this relay has no verified domains; discovery is unavailable"
-                }
-            })),
-        )
-            .into_response();
+        // Open-relay / receipts-only mode (#32): no claimed domains
+        // but we DO have a signing identity. Advertise the identity
+        // so peers can verify our receipts; leave the domain fields
+        // empty so older clients see "no domain to publish under".
+        let relay_url = state.public_url.clone().unwrap_or_default();
+        return Json(DiscoveryDocument {
+            version: 1,
+            domain: String::new(),
+            relay_url,
+            supported_suites: vec!["AMP-PQ-1"],
+            policy: DiscoveryPolicy {
+                registration: "open",
+                require_token_for_push: rt.require_token_for_push,
+                require_token_for_identity_put: rt.require_token_for_identity_put,
+            },
+            relay_identity: relay_identity_doc,
+        })
+        .into_response();
     }
 
     // Pick the domain that matches the request Host header if any of the
     // claimed domains appear in it; otherwise fall back to the first verified
     // domain (the canonical one for this relay).
-    let host_lower = host_header.split(':').next().unwrap_or("").to_ascii_lowercase();
     let chosen = verified
         .iter()
         .find(|d| host_lower == d.domain || host_lower.ends_with(&format!(".{}", d.domain)))
@@ -95,15 +114,7 @@ pub async fn well_known_aegis_config(
         .clone()
         .unwrap_or_else(|| format!("https://{}", chosen.domain));
 
-    let rt = state.runtime.read().unwrap();
     let registration = "managed";
-
-    // Parse the persisted relay identity (signed at boot) and
-    // expose its public document. We swallow parse failures rather
-    // than fail the whole discovery doc — a malformed identity
-    // shouldn't take down discovery for senders that don't need
-    // receipts.
-    let relay_identity_doc = crate::relay_identity::public_document(&state.relay_identity).ok();
 
     Json(DiscoveryDocument {
         version: 1,
@@ -145,6 +156,10 @@ mod tests {
             runtime_config_path: std::path::PathBuf::from("/tmp/test-runtime.json"),
             public_url: Some("https://relay.example.test".into()),
             relay_identity: Arc::new(crate::relay_identity::generate().expect("test relay identity")),
+            federation_discovery_cache: Arc::new(
+                crate::federation_verify::DiscoveryCache::default_ttl(),
+            ),
+            federation_trusted_peers: None,
         })
     }
 
@@ -155,7 +170,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_returns_404_when_no_verified_domain() {
+    async fn discovery_returns_relay_identity_even_without_verified_domain() {
+        // Pre-#32 this returned 404. Post-#32 a relay always has a
+        // signing identity (generated at first boot) — discovery has
+        // to expose those keys so peers can verify our receipts even
+        // before any domain has been claimed.
+        //
+        // The doc still indicates "no domain claimed" via empty
+        // string and `policy.registration = "open"`; older clients
+        // that always read the domain field see "" rather than
+        // exploding.
         let state = build_state().await;
         let app = router(state);
         let resp = app
@@ -168,7 +192,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 32_768).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["domain"], "");
+        assert_eq!(json["policy"]["registration"], "open");
+        // Relay identity present + has signing keys — that's the
+        // whole point of returning a doc here.
+        assert!(json["relay_identity"].is_object(), "{json}");
+        assert!(
+            json["relay_identity"]["signing_keys"].is_array(),
+            "expected signing_keys array in relay_identity, got {}",
+            json["relay_identity"]
+        );
     }
 
     #[tokio::test]

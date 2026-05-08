@@ -490,6 +490,33 @@ pub trait Store: Send + Sync {
         target_url: &str,
         receipt_json: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Return every `outbound_deliveries` row for a given envelope id
+    /// — typically multi-target with one row per peer (#30). Used by
+    /// `GET /admin/deliveries/:envelope_id` for operator forensics
+    /// (#32 part 2): the full attempt history + signed receipts.
+    async fn list_deliveries_for_envelope(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Vec<DeliveryRecord>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Full row of `outbound_deliveries` exposed to the admin API. Distinct
+/// from `OutboundDelivery` (which is the worker-facing view) because
+/// the admin surface includes `receipt_json` and the lifecycle
+/// timestamps every status uses.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    pub envelope_id: String,
+    pub target_url: String,
+    pub status: String,
+    pub attempts: u32,
+    pub next_retry_at: String,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
+    pub receipt_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +999,13 @@ impl Store for FileStore {
         _receipt_json: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+
+    async fn list_deliveries_for_envelope(
+        &self,
+        _envelope_id: &str,
+    ) -> Result<Vec<DeliveryRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
     }
 }
 
@@ -2482,6 +2516,43 @@ impl Store for SqliteStore {
             })
             .await?;
         Ok(())
+    }
+
+    async fn list_deliveries_for_envelope(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Vec<DeliveryRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        let envelope_id = envelope_id.to_string();
+        let rows = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT envelope_id, target_url, status, attempts, next_retry_at, \
+                            last_error, last_attempt_at, created_at, delivered_at, receipt_json \
+                     FROM outbound_deliveries \
+                     WHERE envelope_id = ?1 \
+                     ORDER BY target_url ASC",
+                )?;
+                let rows: Vec<DeliveryRecord> = stmt
+                    .query_map(rusqlite::params![envelope_id], |r| {
+                        Ok(DeliveryRecord {
+                            envelope_id: r.get(0)?,
+                            target_url: r.get(1)?,
+                            status: r.get(2)?,
+                            attempts: r.get::<_, i64>(3)?.max(0) as u32,
+                            next_retry_at: r.get(4)?,
+                            last_error: r.get(5)?,
+                            last_attempt_at: r.get(6)?,
+                            created_at: r.get(7)?,
+                            delivered_at: r.get(8)?,
+                            receipt_json: r.get(9)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
     }
 }
 
