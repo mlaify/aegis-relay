@@ -192,17 +192,19 @@ pub fn spawn_delivery_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()
         .unwrap_or(DEFAULT_MAX_ATTEMPTS);
 
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(format!(
-                "aegis-relay/{} federation",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-        {
+        // Phase 6 (#32 part 3): pull mTLS / custom-CA config from env at
+        // worker start. A misconfig (e.g. missing key file, malformed
+        // PEM) is reported once at boot and the worker exits — better
+        // than silently downgrading to anonymous federation when an
+        // operator asked for client-cert auth.
+        let client = match build_http_client_from_env() {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(target: "federation", error = %e, "failed to build HTTP client; federation disabled");
+                tracing::error!(
+                    target: "federation",
+                    error = %e,
+                    "failed to build HTTP client; federation disabled"
+                );
                 return;
             }
         };
@@ -696,6 +698,147 @@ fn extract_receipt_field(body: &str) -> Option<String> {
     serde_json::to_string(receipt).ok()
 }
 
+// --- HTTP client construction (#32 part 3 mTLS) ----------------------------
+
+/// Errors surfaced when building the federation HTTP client. Distinct
+/// type so the boot path can log a structured reason rather than a
+/// generic `reqwest::Error`.
+#[derive(Debug)]
+pub enum FederationClientError {
+    /// Cert path set but key path missing (or vice-versa). mTLS needs
+    /// both; refuse to start in a half-configured state rather than
+    /// silently fall back to anonymous federation.
+    IncompleteMtlsConfig,
+    /// Couldn't read one of the configured PEM files.
+    PemRead { path: String, source: std::io::Error },
+    /// Failed to parse a PEM blob (cert, key, or CA bundle).
+    PemDecode(String),
+    /// Underlying reqwest builder failure (TLS engine setup etc.).
+    Reqwest(reqwest::Error),
+}
+
+impl std::fmt::Display for FederationClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteMtlsConfig => write!(
+                f,
+                "AEGIS_FEDERATION_CLIENT_CERT_PATH and AEGIS_FEDERATION_CLIENT_KEY_PATH \
+                 must both be set, or both unset"
+            ),
+            Self::PemRead { path, source } => write!(f, "read {path}: {source}"),
+            Self::PemDecode(s) => write!(f, "PEM decode: {s}"),
+            Self::Reqwest(e) => write!(f, "reqwest: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FederationClientError {}
+
+/// Read mTLS / CA-bundle config from process env and build the
+/// federation HTTP client. Convenience wrapper that defers to
+/// `build_http_client_with` so tests can inject paths without
+/// `std::env::set_var` racing.
+pub fn build_http_client_from_env() -> Result<reqwest::Client, FederationClientError> {
+    let cert = std::env::var("AEGIS_FEDERATION_CLIENT_CERT_PATH").ok();
+    let key = std::env::var("AEGIS_FEDERATION_CLIENT_KEY_PATH").ok();
+    let ca = std::env::var("AEGIS_FEDERATION_CA_BUNDLE_PATH").ok();
+    build_http_client_with(cert.as_deref(), key.as_deref(), ca.as_deref())
+}
+
+/// Construct the federation HTTP client with optional sender-side mTLS
+/// (client cert presented during the TLS handshake) and an optional
+/// custom CA bundle for verifying peer TLS certs.
+///
+/// Both `cert_path` and `key_path` must be `Some` together for mTLS to
+/// activate. A half-configured state (one set, one not) is treated as
+/// a hard error so misconfig is loud at startup rather than silent at
+/// federation time.
+///
+/// `ca_path` is independent — operators using a private/internal CA
+/// for their relay-to-relay TLS (vs. publicly-trusted certs) can point
+/// at the bundle without enabling mTLS.
+pub fn build_http_client_with(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    ca_path: Option<&str>,
+) -> Result<reqwest::Client, FederationClientError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(format!(
+            "aegis-relay/{} federation",
+            env!("CARGO_PKG_VERSION")
+        ));
+
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            // reqwest's rustls-tls feature exposes `Identity::from_pem`
+            // which expects a single PEM blob containing BOTH cert and
+            // key. We keep the two-file env-var UX (operators rarely
+            // have a single combined PEM — Let's Encrypt + most CAs
+            // hand out separate fullchain.pem + privkey.pem) by
+            // reading both files and concatenating in-memory.
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                FederationClientError::PemRead {
+                    path: cert_path.to_string(),
+                    source: e,
+                }
+            })?;
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                FederationClientError::PemRead {
+                    path: key_path.to_string(),
+                    source: e,
+                }
+            })?;
+            let combined = concat_pem(&cert_pem, &key_pem);
+            let identity = reqwest::Identity::from_pem(&combined)
+                .map_err(|e| FederationClientError::PemDecode(e.to_string()))?;
+            builder = builder.identity(identity);
+            tracing::info!(
+                target: "federation",
+                cert_path,
+                "mTLS client cert loaded; outbound federation will present it during TLS handshake"
+            );
+        }
+        (None, None) => {
+            // Default: no mTLS. Federation pushes use whatever auth
+            // the receiving relay's HTTP layer requires (bearer token,
+            // CF Access JWT, or nothing).
+        }
+        _ => return Err(FederationClientError::IncompleteMtlsConfig),
+    }
+
+    if let Some(ca_path) = ca_path {
+        let ca_pem = std::fs::read(ca_path).map_err(|e| FederationClientError::PemRead {
+            path: ca_path.to_string(),
+            source: e,
+        })?;
+        let cert = reqwest::Certificate::from_pem(&ca_pem)
+            .map_err(|e| FederationClientError::PemDecode(e.to_string()))?;
+        builder = builder.add_root_certificate(cert);
+        tracing::info!(
+            target: "federation",
+            ca_path,
+            "added custom CA root for peer TLS verification"
+        );
+    }
+
+    builder.build().map_err(FederationClientError::Reqwest)
+}
+
+/// Concatenate cert + key PEM blobs into the single buffer
+/// `Identity::from_pem` expects. Inserts a newline between them if
+/// the cert blob doesn't end with one — defensive against PEM files
+/// missing a trailing LF (some tooling produces these).
+fn concat_pem(cert_pem: &[u8], key_pem: &[u8]) -> Vec<u8> {
+    let mut combined = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
+    combined.extend_from_slice(cert_pem);
+    if !cert_pem.ends_with(b"\n") {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(key_pem);
+    combined
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -982,6 +1125,136 @@ mod tests {
         // shouldn't panic — just yield None and let the caller log.
         assert!(extract_receipt_field("502 bad gateway").is_none());
         assert!(extract_receipt_field("").is_none());
+    }
+
+    // --- mTLS client construction (#32 part 3) -----------------------------
+
+    #[test]
+    fn http_client_builds_with_no_mtls_config() {
+        // Default: no env vars set → anonymous federation, builder
+        // succeeds. Mirrors the steady-state pre-#32-part-3 behavior.
+        let client = build_http_client_with(None, None, None);
+        assert!(client.is_ok(), "default client should build, got {:?}", client.err());
+    }
+
+    #[test]
+    fn http_client_rejects_half_configured_mtls() {
+        // Cert without key, or key without cert, is a misconfig.
+        // Hard error so operators see the bad config at boot rather
+        // than discovering it only when federation fails to handshake.
+        let cert_only = build_http_client_with(Some("/tmp/cert.pem"), None, None);
+        assert!(matches!(
+            cert_only,
+            Err(FederationClientError::IncompleteMtlsConfig)
+        ), "cert-only config should error, got {:?}", cert_only);
+
+        let key_only = build_http_client_with(None, Some("/tmp/key.pem"), None);
+        assert!(matches!(
+            key_only,
+            Err(FederationClientError::IncompleteMtlsConfig)
+        ), "key-only config should error, got {:?}", key_only);
+    }
+
+    #[test]
+    fn http_client_surfaces_missing_cert_file() {
+        // Both env vars set but the cert file doesn't exist on disk.
+        // Should report the path so the operator knows what to fix.
+        let result = build_http_client_with(
+            Some("/tmp/aegis-test-does-not-exist-cert.pem"),
+            Some("/tmp/aegis-test-does-not-exist-key.pem"),
+            None,
+        );
+        match result {
+            Err(FederationClientError::PemRead { path, .. }) => {
+                assert_eq!(path, "/tmp/aegis-test-does-not-exist-cert.pem");
+            }
+            other => panic!("expected PemRead error for missing cert, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn http_client_surfaces_pem_decode_failure() {
+        // Both files exist but the cert PEM is malformed. Operator
+        // should see a clear "PEM decode" error rather than a
+        // generic builder failure.
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!(
+            "aegis-test-mtls-bad-cert-{}.pem",
+            std::process::id()
+        ));
+        let key_path = dir.join(format!(
+            "aegis-test-mtls-bad-key-{}.pem",
+            std::process::id()
+        ));
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(b"not a real PEM")
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(b"not a real PEM either")
+            .unwrap();
+
+        let result = build_http_client_with(
+            Some(cert_path.to_str().unwrap()),
+            Some(key_path.to_str().unwrap()),
+            None,
+        );
+
+        // Cleanup before assertions so a panic doesn't strand /tmp files.
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        assert!(
+            matches!(result, Err(FederationClientError::PemDecode(_))),
+            "expected PemDecode for malformed PEM, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn http_client_ca_bundle_independent_of_mtls() {
+        // Custom CA without mTLS is a valid config (operator using a
+        // private CA for peer TLS verification but not presenting a
+        // client cert). Builder should not require mTLS env vars
+        // when CA is set.
+        let result = build_http_client_with(None, None, Some("/tmp/aegis-test-no-such-ca.pem"));
+        match result {
+            Err(FederationClientError::PemRead { path, .. }) => {
+                // Got past the mTLS-config check, failed on the
+                // missing CA file — exactly what we want.
+                assert_eq!(path, "/tmp/aegis-test-no-such-ca.pem");
+            }
+            other => panic!(
+                "expected PemRead for missing CA, got {:?} (CA path should be checked independently of mTLS)",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn concat_pem_inserts_newline_when_cert_lacks_trailing_lf() {
+        // PEM concatenation must ensure the key's "-----BEGIN PRIVATE
+        // KEY-----" doesn't get glued onto the cert's final line.
+        let cert = b"-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----";
+        let key = b"-----BEGIN PRIVATE KEY-----\nXYZ\n-----END PRIVATE KEY-----\n";
+        let combined = concat_pem(cert, key);
+        let combined_str = String::from_utf8(combined).unwrap();
+        assert!(combined_str.contains("-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn concat_pem_does_not_double_newline_when_already_terminated() {
+        // If the cert PEM already ends with LF, don't add another.
+        let cert = b"-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n";
+        let key = b"-----BEGIN PRIVATE KEY-----\nXYZ\n-----END PRIVATE KEY-----\n";
+        let combined = concat_pem(cert, key);
+        let combined_str = String::from_utf8(combined).unwrap();
+        // Exactly one newline between the two blocks.
+        assert!(combined_str.contains("-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----"));
+        assert!(!combined_str.contains("-----END CERTIFICATE-----\n\n-----BEGIN PRIVATE KEY-----"));
     }
 
     #[tokio::test]
