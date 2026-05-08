@@ -540,6 +540,53 @@ fn domain_entry_to_item(e: crate::storage::DomainEntry) -> DomainListItem {
     }
 }
 
+/// Classified failure modes from the DNS TXT lookup that backs
+/// `admin_verify_domain`. Kept narrow: most callers only care about the
+/// "no record yet" vs "transient timeout" distinction so the SPA can
+/// give operator-actionable advice (mlaify/aegis-relay#34).
+#[derive(Debug)]
+enum VerifyDnsError {
+    /// Authoritative answer with no TXT records (covers NXDOMAIN too —
+    /// hickory collapses both into `NoRecordsFound`). Operator action:
+    /// publish the record from the claim response.
+    NoRecord,
+    /// Hickory gave up after the configured timeout window.
+    Timeout,
+    /// Anything else from the resolver — surfaced verbatim.
+    Other(String),
+}
+
+/// How long (in seconds) the DNS verify lookup waits before giving up.
+/// Read at lookup time so operators can tune live without a redeploy.
+fn verify_timeout_secs() -> u64 {
+    parse_verify_timeout_secs(
+        std::env::var("AEGIS_DNS_VERIFY_TIMEOUT_SECS").ok().as_deref(),
+    )
+}
+
+fn parse_verify_timeout_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3)
+}
+
+/// Build the hickory `ResolverOpts` used by `admin_verify_domain`.
+/// Pulled out as a pure function so tests can inject the env-var value
+/// without `set_var` (which races against parallel tests).
+///
+/// Defaults differ from `ResolverOpts::default()` on two axes:
+///   - `timeout`: 3s (vs hickory's 5s)
+///   - `attempts`: 1 (vs hickory's 2)
+/// Combined: a missing record fails in ~3s instead of ~10s+. Verified
+/// records aren't affected — the cap is on the outright-fail path.
+fn build_verify_resolver_opts_with(timeout_secs_env: Option<&str>) -> hickory_resolver::config::ResolverOpts {
+    let timeout_secs = parse_verify_timeout_secs(timeout_secs_env);
+    let mut opts = hickory_resolver::config::ResolverOpts::default();
+    opts.timeout = std::time::Duration::from_secs(timeout_secs);
+    opts.attempts = 1;
+    opts
+}
+
 fn normalize_domain(input: &str) -> Option<String> {
     let d = input.trim().trim_end_matches('.').to_ascii_lowercase();
     if d.is_empty() || d.contains('/') || d.contains(' ') || !d.contains('.') {
@@ -685,16 +732,43 @@ pub async fn admin_verify_domain(
     };
 
     let verify_target = format!("_aegis-verify.{}", domain);
-    let lookup = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-        use hickory_resolver::config::*;
+    let timeout_secs = verify_timeout_secs();
+    let lookup = tokio::task::spawn_blocking(move || -> Result<Vec<String>, VerifyDnsError> {
+        use hickory_resolver::config::ResolverConfig;
+        use hickory_resolver::error::ResolveErrorKind;
         use hickory_resolver::Resolver;
-        let resolver =
-            Resolver::new(ResolverConfig::default(), ResolverOpts::default()).map_err(|e| e.to_string())?;
-        let txts = resolver.txt_lookup(verify_target).map_err(|e| e.to_string())?;
-        Ok(txts
-            .into_iter()
-            .flat_map(|r| r.txt_data().iter().map(|d| String::from_utf8_lossy(d).to_string()).collect::<Vec<_>>())
-            .collect())
+
+        let opts = build_verify_resolver_opts_with(
+            std::env::var("AEGIS_DNS_VERIFY_TIMEOUT_SECS").ok().as_deref(),
+        );
+        let resolver = Resolver::new(ResolverConfig::default(), opts)
+            .map_err(|e| VerifyDnsError::Other(e.to_string()))?;
+
+        match resolver.txt_lookup(verify_target) {
+            Ok(txts) => Ok(txts
+                .into_iter()
+                .flat_map(|r| {
+                    r.txt_data()
+                        .iter()
+                        .map(|d| String::from_utf8_lossy(d).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()),
+            Err(e) => Err(match e.kind() {
+                // hickory returns NoRecordsFound both for NXDOMAIN and
+                // "domain exists but no TXT records published" — for
+                // operator-facing UX they mean the same thing: there's
+                // nothing at the verify name yet.
+                ResolveErrorKind::NoRecordsFound { .. } => VerifyDnsError::NoRecord,
+                // Explicit timeout. With our 3s default + 1 attempt
+                // this should fire ~3s after the click rather than
+                // the 10s+ that hickory's defaults produced.
+                ResolveErrorKind::Timeout => VerifyDnsError::Timeout,
+                // Most other proto-layer errors aren't transient; surface
+                // the raw message and let the operator decide.
+                _ => VerifyDnsError::Other(e.to_string()),
+            }),
+        }
     })
     .await;
 
@@ -712,8 +786,24 @@ pub async fn admin_verify_domain(
             }
             found
         }
-        Ok(Err(e)) => {
-            detail = Some(format!("DNS lookup failed: {e}"));
+        Ok(Err(VerifyDnsError::NoRecord)) => {
+            detail = Some(format!(
+                "no TXT record published at _aegis-verify.{}; \
+                 publish the record from the claim response and retry",
+                domain
+            ));
+            false
+        }
+        Ok(Err(VerifyDnsError::Timeout)) => {
+            detail = Some(format!(
+                "DNS lookup for _aegis-verify.{} timed out after {}s; \
+                 retry in a moment (your record may still be propagating)",
+                domain, timeout_secs
+            ));
+            false
+        }
+        Ok(Err(VerifyDnsError::Other(msg))) => {
+            detail = Some(format!("DNS lookup failed: {msg}"));
             false
         }
         Err(_) => {
@@ -970,5 +1060,68 @@ pub async fn admin_deprovision_user(
             Json(serde_json::json!({ "error": { "code": "storage_error", "message": "deprovision failed" } })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // --- DNS verify resolver options (mlaify/aegis-relay#34) -----------
+
+    #[test]
+    fn parse_verify_timeout_defaults_to_three_seconds() {
+        // No env var set → 3s default. Chosen to be tight enough that
+        // the SPA Verify button doesn't feel hung when the TXT record
+        // is missing, loose enough that real lookups against slow
+        // resolvers (corporate split-horizon, captive portals) still
+        // succeed.
+        assert_eq!(parse_verify_timeout_secs(None), 3);
+    }
+
+    #[test]
+    fn parse_verify_timeout_honors_env_var() {
+        assert_eq!(parse_verify_timeout_secs(Some("7")), 7);
+        assert_eq!(parse_verify_timeout_secs(Some("30")), 30);
+    }
+
+    #[test]
+    fn parse_verify_timeout_falls_back_on_invalid_input() {
+        // Garbage / negatives / floats / empty all collapse to default.
+        // Operators editing .env shouldn't be able to silently shoot
+        // themselves in the foot.
+        assert_eq!(parse_verify_timeout_secs(Some("nope")), 3);
+        assert_eq!(parse_verify_timeout_secs(Some("")), 3);
+        assert_eq!(parse_verify_timeout_secs(Some("3.5")), 3);
+        assert_eq!(parse_verify_timeout_secs(Some("-1")), 3);
+    }
+
+    #[test]
+    fn parse_verify_timeout_zero_falls_back_to_default() {
+        // Zero would mean "never timeout" in some libs; here it'd be
+        // an instant-fail. Either way it's not what an operator
+        // intended, so default it.
+        assert_eq!(parse_verify_timeout_secs(Some("0")), 3);
+    }
+
+    #[test]
+    fn build_verify_resolver_opts_uses_short_timeout_and_one_attempt() {
+        let opts = build_verify_resolver_opts_with(None);
+        assert_eq!(opts.timeout, Duration::from_secs(3));
+        assert_eq!(
+            opts.attempts, 1,
+            "we want one attempt so a missing record fails fast — \
+             hickory's default of 2 doubles the perceived latency"
+        );
+    }
+
+    #[test]
+    fn build_verify_resolver_opts_threads_env_through() {
+        let opts = build_verify_resolver_opts_with(Some("12"));
+        assert_eq!(opts.timeout, Duration::from_secs(12));
+        // attempts stays pinned at 1 regardless of the env timeout —
+        // operators don't get to dial up retries on this code path.
+        assert_eq!(opts.attempts, 1);
     }
 }
